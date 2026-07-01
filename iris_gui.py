@@ -4243,15 +4243,19 @@ class StreamTab(QWidget):
             time_str, item["filename"],
             f"{size_mb:.2f} MB", transfer_str, "received", item)
         self._log(f"Received {item['filename']} \u2014 {elapsed:.1f}s, {speed:.0f} KB/s")
-        self.pending_row = row
-        self._pending_lbl.setText(
-            f"New clip: {item['filename']}\nKeep it, or delete it?")
-        self._pending_lbl.setStyleSheet(
-            f"color:{self._ORANGE};background:transparent;"
-            f"font-family:'Segoe UI';font-size:9pt;")
-        self._keep_btn.setEnabled(True)
-        self._delete_btn.setEnabled(True)
-        self._format_btn.setEnabled(True)
+        #self.pending_row = row
+        # self._pending_lbl.setText(
+        #    f"New clip: {item['filename']}\nKeep it, or delete it?")
+        # self._pending_lbl.setStyleSheet(
+         #   f"color:{self._ORANGE};background:transparent;"
+        #  f"font-family:'Segoe UI';font-size:9pt;")
+        # self._keep_btn.setEnabled(True)
+        # self._delete_btn.setEnabled(True)
+        # self._format_btn.setEnabled(True)
+
+        self._send_command("keep", item.get("ip"))
+        self._set_row_status(row, "kept")
+        
         # ── face recognition: process keyframes in a worker thread ────
         # Only fires when iris_fusion is loaded and DeepFace is ready.
         # Safe to skip if not — the clip is still kept/deleted normally.
