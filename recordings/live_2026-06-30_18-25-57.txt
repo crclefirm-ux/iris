@@ -1,0 +1,14 @@
+[00:00.00 -> 00:10.88]  So I'm going to start a new transcription Hi my name is Hamza
+[00:10.88 -> 00:20.24]  So we're currently having a meeting with firmware slash electrical slash software
+[00:20.24 -> 00:26.52]  team they're jack of many trades all of them
+[00:26.52 -> 00:34.68]  currently in this meeting I have Ali, I have Pranav, I have Zain, I have Dia, and myself
+[00:34.68 -> 00:45.36]  included we are currently trying to do to do a demo test before we actually do
+[00:45.36 -> 00:50.26]  the demo tomorrow morning which is from 8 a.m. to 9 a.m. and that's with
+[00:50.26 -> 01:01.02]  Kyle, Nick, potentially a few other people who I know will be there even though I
+[01:01.02 -> 01:07.78]  destroyed a 3d printer and we won't have an actual frame we'll be able to run
+[01:07.78 -> 01:15.22]  the demo with our ESP 32 chips so I think it would be a very clean demo I
+[01:15.22 -> 01:21.38]  think it's important to note too we have to be there 20 minutes early so if
+[01:21.38 -> 01:25.22]  anything I would like you to remind me that I have to be there 20 minutes
+[01:25.22 -> 01:32.02]  early it's like priority for me also with that being said I have to
+[01:32.02 -> 01:40.14]  make sure that I study for my dynamics which is on Thursday morning at 10 30
+[01:40.14 -> 01:45.62]  a.m. in the morning so I'm not sure I run through a few

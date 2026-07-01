@@ -72,6 +72,10 @@ try:
 except Exception:
     iphotos = None
 try:
+    import iris_videos as ivideos                        # type: ignore
+except Exception:
+    ivideos = None
+try:
     import iris_fusion                                   # type: ignore
 except Exception:
     iris_fusion = None
@@ -734,9 +738,17 @@ class ChatTab(QWidget):
             "from it and never invent details. If something isn't in the "
             "transcript, say so. Be concise, and when summarizing a recording, "
             "offer 2-3 specific follow-up questions the user could ask about it. "
-            "If no transcript is included in the message you are answering, "
-            "you do NOT have access to any recording's contents: do not guess "
-            "or invent what a recording says, and say it isn't available."
+            "You can ALSO access the ESP32 camera's saved video clips: when a "
+            "list of saved video clips is provided below, it includes each "
+            "clip's recording time, length, and how many people were detected "
+            "in it (with recognised names when available). Use that data to "
+            "answer questions about the videos, such as how many people were in "
+            "a clip or who was seen. Answer strictly from the clip data given; "
+            "if a detail isn't there, say so. "
+            "If neither a transcript nor any video-clip data is included in the "
+            "message you are answering, you do NOT have access to that "
+            "recording's or clip's contents: do not guess or invent what it "
+            "says, and say it isn't available."
         )
         # Session history (sidebar). Degrades gracefully if the module is gone.
         self._sessions = isess.SessionStore() if isess is not None else None
@@ -745,6 +757,21 @@ class ChatTab(QWidget):
         # Photo capture store. Degrades gracefully if the module is gone.
         self._photos = (iphotos.PhotoStore(_photos_dir())
                         if iphotos is not None else None)
+        # Video-clip store — lets the chat see the ESP32's saved .avi clips
+        # and how many people were in them. Degrades gracefully if missing.
+        self._videos = None
+        if ivideos is not None:
+            fusion_getter = (iris_fusion.get_fusion
+                             if iris_fusion is not None else None)
+            try:
+                self._videos = ivideos.VideoStore(fusion_getter=fusion_getter)
+            except Exception as e:
+                print(f"[video] could not start VideoStore: {e}")
+                self._videos = None
+        else:
+            print("[video] iris_videos.py not found — the chat will not be "
+                  "able to answer questions about saved video clips. Make "
+                  "sure iris_videos.py is in the same folder as iris_gui.py.")
         # The currently-selected photo (clicked in the Photos tab, or
         # resolved by a chat query) — lets follow-ups reference "this photo".
         self._active_photo: Optional[object] = None
@@ -1136,6 +1163,14 @@ class ChatTab(QWidget):
             act_intent = None
         if act_intent is not None and act_intent.kind != "none":
             self._handle_action_intent(act_intent)
+            return
+        # A question ABOUT a saved video clip ("how many people were in the
+        # video?", "who was in that clip?"). Intercept it here so it always
+        # gets the real clip data — otherwise phrasings like "who was in the
+        # video" get swallowed by the memory recall classifier below and the
+        # video data is never consulted.
+        if self._videos is not None and self._is_video_question(low):
+            self._start_bg(lambda: self._answer_video_question(text))
             return
         # M7: memory recall takes priority. "Conversations with Pranav"
         # should route to ChromaDB, not to a fuzzy WAV-name match.
@@ -2405,6 +2440,51 @@ class ChatTab(QWidget):
         except Exception as exc:
             return f"(ollama error while answering memory query: {exc})"
 
+    @staticmethod
+    def _is_video_question(low: str) -> bool:
+        """True for a question about a saved ESP32 video clip — a video noun
+        plus either a question word or a 'how many / who' cue. Deliberately
+        does NOT fire on 'record a video' (that's an action, handled earlier)
+        because those never contain 'was in / were in / how many / who'."""
+        # "recording" is deliberately excluded — in this app it means an audio
+        # recording, so it must keep routing to the transcript handlers.
+        if not any(w in low for w in ("video", "clip", "footage")):
+            return False
+        cues = ("how many", "how much", "who ", "who's", "whos", "was in",
+                "were in", "people in", "person in", "in the video",
+                "in that video", "in the clip", "in that clip", "in the "
+                "footage", "count", "what happened", "what's in", "whats in",
+                "show me the video", "last video", "the video")
+        # A question mark alone also qualifies when a video noun is present.
+        return low.strip().endswith("?") or any(c in low for c in cues)
+
+    def _answer_video_question(self, text: str) -> str:
+        """Answer a question about saved video clips using their real analysis
+        (people counts, recognised names, times). Guarantees the clip data is
+        in context regardless of how the classifier routed things."""
+        if self._client is None:
+            return "(ollama not connected)"
+        vctx = ""
+        if self._videos is not None:
+            try:
+                vctx = self._videos.describe_recent(limit=8)
+            except Exception as e:
+                print(f"[video] describe_recent failed: {e}")
+        messages = [{"role": "system", "content": self._system_prompt}]
+        if vctx:
+            messages.append({"role": "system", "content": vctx})
+        else:
+            messages.append({"role": "system", "content":
+                "No saved ESP32 video clips were found on disk yet. Tell the "
+                "user there are no analysed video clips available to answer "
+                "from."})
+        messages.extend(self.history)
+        try:
+            resp = self._client.chat(model=OLLAMA_MODEL, messages=messages)
+            return resp["message"]["content"].strip()
+        except Exception as exc:
+            return f"(ollama error: {exc})"
+
     def _ask_ollama(self, text: str) -> str:
             """General-purpose Ollama call. Injects summaries from the most
             recent transcribed recordings into context so questions like
@@ -2440,6 +2520,18 @@ class ChatTab(QWidget):
 
             if ctx:
                 messages.append({"role": "system", "content": ctx})
+
+            # Video-clip awareness: list the ESP32's recent saved clips and
+            # how many people were in each, so questions like "how many people
+            # were in the video" are answered from real data instead of the
+            # old "I can't access video recordings" fallback.
+            if self._videos is not None:
+                try:
+                    vctx = self._videos.describe_recent(limit=5)
+                    if vctx:
+                        messages.append({"role": "system", "content": vctx})
+                except Exception:
+                    pass
 
             messages.extend(self.history)
             try:
@@ -4255,7 +4347,7 @@ class StreamTab(QWidget):
 
         self._send_command("keep", item.get("ip"))
         self._set_row_status(row, "kept")
-        
+       
         # ── face recognition: process keyframes in a worker thread ────
         # Only fires when iris_fusion is loaded and DeepFace is ready.
         # Safe to skip if not — the clip is still kept/deleted normally.
@@ -4320,6 +4412,8 @@ class StreamTab(QWidget):
             frame_step = max(1, int(fps))
             frame_idx  = 0
             faces_found = 0
+            person_ids = set()        # distinct people → "how many people"
+            names      = {}           # person_id → recognised name
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -4329,12 +4423,38 @@ class StreamTab(QWidget):
                     # the frame if the previous call is still running.
                     results = fusion.process_frame(frame)
                     faces_found += len(results)
+                    for pf in results:
+                        person_ids.add(pf.person_id)
+                        if getattr(pf, "name", ""):
+                            names[pf.person_id] = pf.name
                 frame_idx += 1
             cap.release()
             if faces_found:
                 print(f"[faces] {os.path.basename(filepath)}: "
                       f"{faces_found} face detection(s) across "
                       f"{frame_idx} frames")
+            # Persist a per-clip analysis sidecar so the chat can answer
+            # "how many people were in that video?" — the distinct-person
+            # count and recognised names, cached next to the .avi.
+            if ivideos is not None:
+                try:
+                    clip_names = [names[i] for i in person_ids if i in names]
+                    ivideos.record_analysis(
+                        filepath,
+                        people_count=len(person_ids),
+                        people_names=clip_names,
+                        duration_sec=(frame_idx / fps) if fps else None,
+                        frames_sampled=(frame_idx // frame_step) + 1,
+                        method="fusion",
+                        note=f"{len(person_ids)} distinct "
+                             f"person(s) via face recognition")
+                    who = f" ({', '.join(clip_names)})" if clip_names else ""
+                    print(f"[video] analysed {os.path.basename(filepath)}: "
+                          f"{len(person_ids)} person(s){who} — saved so the "
+                          f"chat can answer questions about this clip.")
+                except Exception as e:
+                    print(f"[faces] could not write video sidecar "
+                          f"({os.path.basename(filepath)}): {e}")
         except Exception as e:
                     print(f"[faces] clip processing failed "
                         f"({os.path.basename(filepath)}): {e}")
@@ -6467,6 +6587,24 @@ class IrisApp(QWidget):
         # to it. The stream tab handles its own ESP32 networking exactly
         # like terminal.py and is the right home for "of me" photos.
         self.stream = StreamTab(self)
+        # Point the chat's video store at the Stream tab's real save folder
+        # (from terminal.py's SAVE_FOLDER) so "how many people were in the
+        # video?" reads the exact clips the receiver just wrote to disk,
+        # instead of only the auto-guessed default locations.
+        try:
+            if getattr(self.chat, "_videos", None) is not None:
+                for attr in ("SAVE_FOLDER", "PHOTO_FOLDER"):
+                    folder = getattr(self.stream, attr, None)
+                    if folder:
+                        self.chat._videos.add_folder(folder)
+                try:
+                    n = len(self.chat._videos.list_all())
+                    print(f"[video] chat can see {n} saved clip(s) across: "
+                          f"{self.chat._videos.folders()}")
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[video] could not link stream folder to chat: {e}")
         # Give the chat tab a way to fire the ESP32 photo command + show
         # the stream tab while it captures. The chat decides whether a
         # request is "of me" (selfie) vs a bare "take a photo"

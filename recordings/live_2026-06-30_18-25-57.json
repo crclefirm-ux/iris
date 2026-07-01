@@ -1,0 +1,139 @@
+{
+  "audio_file": "live_2026-06-30_18-25-57.wav",
+  "model": "medium.en",
+  "duration_seconds": 103.6654375,
+  "language": "en",
+  "language_probability": 1,
+  "transcription_seconds": 49.78284549713135,
+  "realtime_factor": 0.48022606856920225,
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 10.88,
+      "text": "So I'm going to start a new transcription Hi my name is Hamza",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 10.88,
+      "end": 20.24,
+      "text": "So we're currently having a meeting with firmware slash electrical slash software",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 20.24,
+      "end": 26.52,
+      "text": "team they're jack of many trades all of them",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 26.52,
+      "end": 34.68,
+      "text": "currently in this meeting I have Ali, I have Pranav, I have Zain, I have Dia, and myself",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 34.68,
+      "end": 45.36,
+      "text": "included we are currently trying to do to do a demo test before we actually do",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 45.36,
+      "end": 50.26,
+      "text": "the demo tomorrow morning which is from 8 a.m. to 9 a.m. and that's with",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 50.26,
+      "end": 61.02,
+      "text": "Kyle, Nick, potentially a few other people who I know will be there even though I",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 61.02,
+      "end": 67.78,
+      "text": "destroyed a 3d printer and we won't have an actual frame we'll be able to run",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 67.78,
+      "end": 75.22,
+      "text": "the demo with our ESP 32 chips so I think it would be a very clean demo I",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 75.22,
+      "end": 81.38,
+      "text": "think it's important to note too we have to be there 20 minutes early so if",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 81.38,
+      "end": 85.22,
+      "text": "anything I would like you to remind me that I have to be there 20 minutes",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 85.22,
+      "end": 92.02,
+      "text": "early it's like priority for me also with that being said I have to",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 92.02,
+      "end": 100.14,
+      "text": "make sure that I study for my dynamics which is on Thursday morning at 10 30",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    },
+    {
+      "start": 100.14,
+      "end": 105.62,
+      "text": "a.m. in the morning so I'm not sure I run through a few",
+      "speaker": "Humza?",
+      "speaker_confidence": 0.619,
+      "speaker_kind": "weak",
+      "_cluster": 0
+    }
+  ],
+  "diarized": true,
+  "diarizer": "speechbrain-ecapa"
+}

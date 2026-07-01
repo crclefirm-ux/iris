@@ -1,0 +1,31 @@
+{
+  "audio_file": "live_2026-06-30_18-30-55.wav",
+  "model": "medium.en",
+  "duration_seconds": 72.21975,
+  "language": "en",
+  "language_probability": 1,
+  "transcription_seconds": 4.923550128936768,
+  "realtime_factor": 0.06817456622235285,
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 3.7,
+      "text": "Let me also",
+      "speaker": "Unknown 1",
+      "speaker_confidence": 0.0,
+      "speaker_kind": "unknown",
+      "_cluster": 1
+    },
+    {
+      "start": 5.42,
+      "end": 7.52,
+      "text": "Hey Jarvis, could you take a photo of me?",
+      "speaker": "Unknown 2",
+      "speaker_confidence": 0.0,
+      "speaker_kind": "unknown",
+      "_cluster": 0
+    }
+  ],
+  "diarized": true,
+  "diarizer": "speechbrain-ecapa"
+}
