@@ -102,6 +102,35 @@ def _cfg(attr: str, default):
     return default
 OLLAMA_URL   = _cfg("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = _cfg("OLLAMA_MODEL", "llama3.2:3b")
+
+
+def _try_parse_attributes_json(raw: str) -> dict:
+    """Best-effort JSON parse of Llama attribute-extraction output. Handles
+    bare JSON, JSON wrapped in ``` fences (with or without a 'json' hint),
+    and stray leading/trailing prose. Returns {} on any failure."""
+    if not raw:
+        return {}
+    s = raw.strip()
+    # Strip ```json ... ``` or ``` ... ``` fences if the model added them.
+    if s.startswith("```"):
+        s = s.split("```", 2)
+        s = s[1] if len(s) >= 2 else raw
+        if s.lstrip().lower().startswith("json"):
+            s = s.lstrip()[4:]
+        s = s.strip()
+        if s.endswith("```"):
+            s = s[:-3].strip()
+    # Trim to the outermost braces if there's stray prose around them.
+    start = s.find("{")
+    end   = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        s = s[start:end + 1]
+    try:
+        parsed = json.loads(s)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
 # ── Photo capture — screenshot is the default and only active path. The
 # ESP32 camera trigger below is wired in per the integration guide but OFF
 # by default; flip ESP32_CAMERA_ENABLED in config_phase9.py once the camera
@@ -772,6 +801,10 @@ class ChatTab(QWidget):
             print("[video] iris_videos.py not found — the chat will not be "
                   "able to answer questions about saved video clips. Make "
                   "sure iris_videos.py is in the same folder as iris_gui.py.")
+        # The last video clip a question resolved to — lets follow-ups like
+        # "what color shirt was he wearing" work without re-saying "video".
+        # Mirrors the _active (audio recording) and _active_photo patterns.
+        self._active_video: Optional[object] = None
         # The currently-selected photo (clicked in the Photos tab, or
         # resolved by a chat query) — lets follow-ups reference "this photo".
         self._active_photo: Optional[object] = None
@@ -1170,6 +1203,17 @@ class ChatTab(QWidget):
         # video" get swallowed by the memory recall classifier below and the
         # video data is never consulted.
         if self._videos is not None and self._is_video_question(low):
+            self._start_bg(lambda: self._answer_video_question(text))
+            return
+        # Follow-up path: if a video clip is already the active reference
+        # (the user just asked about it) and this message is a question
+        # that doesn't clearly belong to another domain, keep it in the
+        # video handler. Fixes "what color shirt was he wearing" landing
+        # on the audio-recording flow just because it lacks the word
+        # 'video'.
+        if (self._videos is not None
+                and self._active_video is not None
+                and self._is_video_followup(low)):
             self._start_bg(lambda: self._answer_video_question(text))
             return
         # M7: memory recall takes priority. "Conversations with Pranav"
@@ -2460,6 +2504,53 @@ class ChatTab(QWidget):
         return low.strip().endswith("?") or any(c in low for c in cues)
 
     @staticmethod
+    def _is_video_followup(low: str) -> bool:
+        """True for a follow-up question about a video that omits the
+        word 'video'/'clip'/'footage'. Only used when self._active_video
+        is already set. Deliberately rejects messages that clearly belong
+        to another domain (audio recording, photo, memory recall) so a
+        stale active_video reference never hijacks unrelated chat.
+
+        Positive cues: question-shaped or descriptive phrasing about
+        content — 'what color X', 'who was that', 'what was he doing',
+        'what did they look like', short pronoun questions.
+        """
+        low = low.strip()
+        if not low:
+            return False
+        # Reject if the message clearly belongs to another domain.
+        other_domain = (
+            "recording", "transcript", "audio", "conversation",
+            "photo", "picture", "screenshot", "pic ",
+            "song", "playlist",
+        )
+        if any(w in low for w in other_domain):
+            return False
+        # Positive follow-up shapes — anything that plausibly asks about
+        # the content of the last-referenced clip.
+        followup_cues = (
+            "what color", "what colour", "wearing", "shirt", "pants",
+            "clothes", "clothing", "hair", "hat", "glasses", "beard",
+            "what were they", "what was he", "what was she", "what were",
+            "who was", "who is that", "who's that", "whos that",
+            "what did", "what happened", "what's happening",
+            "whats happening", "what is happening",
+            "what's going on", "whats going on",
+            "background", "setting", "objects", "on the wall",
+            "on the table", "how did they look", "what do they look",
+            "describe", "look like",
+        )
+        if any(c in low for c in followup_cues):
+            return True
+        # Short pronoun-shaped follow-ups: "what about him?", "and her?".
+        if low.endswith("?") and len(low.split()) <= 6:
+            pronouns = (" he ", " him ", " his ", " she ", " her ",
+                        " they ", " them ", " it ")
+            if any(p in f" {low} " for p in pronouns):
+                return True
+        return False
+
+    @staticmethod
     def _is_latest_video_question(low: str) -> bool:
         """True when the user wants specifically the single most recent clip
         ('latest video', 'give me the newest clip', etc). These must NEVER
@@ -2505,7 +2596,15 @@ class ChatTab(QWidget):
         classified by a cheap llama3.2:1b yes/no call instead of trying to
         keyword-match every possible English phrasing — that approach
         doesn't scale, this generalizes to wording we never hardcoded."""
-        if not any(w in low for w in ("video", "clip", "footage")):
+        # Normally require a video noun to fire, so ordinary chat like
+        # "what were you doing?" doesn't get routed to a video answer.
+        # Exception: if a clip is already the active reference (the user
+        # just asked about it), follow-up phrasing without a noun still
+        # counts — otherwise "what color shirt was he wearing" ends up
+        # in the default branch below, which only has clip metadata and
+        # forces Llama to retract its earlier answer.
+        has_video_noun = any(w in low for w in ("video", "clip", "footage"))
+        if not has_video_noun and self._active_video is None:
             return False
         if any(c in low for c in self._SCENE_FAST_CUES):
             return True
@@ -2569,6 +2668,18 @@ class ChatTab(QWidget):
                 return clips[idx] if idx < len(clips) else clips[-1]
         if "oldest" in low or "earliest" in low:
             return clips[-1]
+        # Follow-up default: if a clip is already the active reference AND
+        # this message doesn't explicitly ask for the newest one, keep
+        # pointing at the same clip so "what was he wearing" doesn't jump
+        # to a different clip than "what was in the video" did.
+        if (self._active_video is not None
+                and not any(c in low for c in
+                            ("latest", "newest", "most recent",
+                             "last video", "last clip", "last footage"))):
+            for c in clips:
+                if os.path.normcase(c.path) == os.path.normcase(
+                        self._active_video.path):
+                    return c
         return clips[0]
 
     def _answer_video_question(self, text: str) -> str:
@@ -2593,6 +2704,9 @@ class ChatTab(QWidget):
                 clip = None
             if clip is None:
                 return "There are no saved video clips on disk yet."
+            # Remember this clip so follow-ups like "what color shirt was
+            # he wearing" (no 'video' keyword) still route here.
+            self._active_video = clip
             try:
                 description = self._videos.describe(clip.path)
             except Exception as e:
@@ -2604,13 +2718,32 @@ class ChatTab(QWidget):
                         "visual description right now — the vision model "
                         "may not be running (check Ollama has llava:7b "
                         "available).")
+            # Extract (or read cached) structured attributes from the
+            # paragraph so questions like "what color shirt" can be
+            # answered from a specific field instead of hoping the exact
+            # word survived into the free-text description.
+            attrs = self._get_or_extract_video_attributes(clip)
+            attr_block = self._format_attributes_for_prompt(attrs)
+            attr_section = ("\n\nQUICK-REFERENCE FACTS (extracted from the "
+                            "description above — use these to answer specific "
+                            "questions about clothing, colors, objects, or "
+                            "people, but keep the narrative detail from the "
+                            "description when summarizing):\n" + attr_block
+                            ) if attr_block else ""
             vctx = (
                 f"Visual description of the video clip {clip.name} "
                 f"(recorded {clip.when()}, length {clip.length()}), "
                 f"generated by looking at several frames spread across "
-                f"the clip:\n{description}\n"
-                "Answer the user's question using only this description. "
-                "Do not invent details not mentioned in it.")
+                f"the clip:\n{description}"
+                f"{attr_section}\n\n"
+                "The description above is your primary source — preserve "
+                "its full detail when summarizing what's in the video. "
+                "The quick-reference facts (if any) are a shortcut for "
+                "specific questions like 'what color shirt' or 'who was "
+                "there'. Answer only from what these two sources say; do "
+                "not invent details. If the user asks about something "
+                "neither mentions, say so honestly rather than retracting "
+                "or contradicting any earlier answer.")
             messages = [{"role": "system", "content": self._system_prompt},
                         {"role": "system", "content": vctx}]
             messages.extend(self.history)
@@ -2634,6 +2767,8 @@ class ChatTab(QWidget):
                 clip = self._videos.analyze(clip.path)
             except Exception:
                 pass
+            # Remember this clip so follow-ups still route to the video handler.
+            self._active_video = clip
             vctx = (
                 "The single most recent saved ESP32 video clip is:\n"
                 f"filename: {clip.name}\n"
@@ -2671,6 +2806,162 @@ class ChatTab(QWidget):
             return resp["message"]["content"].strip()
         except Exception as exc:
             return f"(ollama error: {exc})"
+
+    # ── Structured attribute extraction from cached scene descriptions ──
+    # LLaVA gives us one free-text paragraph per clip. That paragraph may
+    # or may not mention specific attributes the user later asks about
+    # ("what color shirt", "was he wearing glasses"). To avoid depending
+    # on whether a word happened to survive into the paragraph, we run
+    # ONE additional Llama pass over that paragraph to extract structured
+    # attributes (per-person clothing / hair / accessories / activity,
+    # setting, notable objects, readable text, notable colors) and cache
+    # them in the same .video.json sidecar under 'scene_attributes'.
+    #
+    # Cost: one text-only Llama call per clip, ever (cached after that).
+    # No new dependencies, no vision-model traffic, no changes to
+    # iris_videos.py — we reuse ivideos.read_sidecar and write back with
+    # a plain json.dump, same pattern record_scene_description uses.
+    _ATTR_EXTRACT_PROMPT = (
+        "You extract structured facts from a text description of a short "
+        "video clip. Output ONLY a JSON object matching this schema, with "
+        "no prose, no markdown, no code fences:\n"
+        "{\n"
+        '  "people": [\n'
+        "    {\n"
+        '      "who": "brief phrase like \'young man\' or \'woman with glasses\'",\n'
+        '      "clothing_top": "e.g. white t-shirt, or null if not mentioned",\n'
+        '      "clothing_bottom": "e.g. black jeans, or null",\n'
+        '      "hair": "e.g. short brown, or null",\n'
+        '      "accessories": ["glasses", "watch"],\n'
+        '      "activity": "what they are doing, or null"\n'
+        "    }\n"
+        "  ],\n"
+        '  "setting": "one sentence about the environment, or null",\n'
+        '  "objects": ["notable objects mentioned"],\n'
+        '  "readable_text": ["any text visible in the scene"],\n'
+        '  "notable_colors": ["colors explicitly mentioned"]\n'
+        "}\n"
+        "Rules: (1) Include ONLY facts explicitly stated in the "
+        "description — never guess, never infer. (2) Use null for missing "
+        "string fields, empty list [] for missing list fields. (3) One "
+        "entry per person mentioned. (4) Output valid JSON only, nothing "
+        "else — no markdown, no ``` fences, no commentary.\n\n"
+        "Description:\n"
+    )
+
+    def _get_or_extract_video_attributes(self, clip) -> dict:
+        """Return structured attributes for a clip, extracting + caching
+        them on first access. Reads from the .video.json sidecar so it
+        survives restarts and only ever costs one Llama call per clip.
+
+        Returns {} on any failure — callers must treat that as
+        'attributes unavailable', not 'clip has no attributes'.
+        """
+        if ivideos is None:
+            return {}
+        try:
+            sidecar = ivideos.read_sidecar(clip.path)
+        except Exception as e:
+            print(f"[video-attrs] read_sidecar failed: {e}")
+            return {}
+        cached = sidecar.get("scene_attributes")
+        if isinstance(cached, dict) and cached:
+            return cached
+        description = sidecar.get("scene_description") or getattr(
+            clip, "scene_description", "") or ""
+        if not description:
+            return {}
+        if self._client is None:
+            return {}
+        # Try format='json' (newer ollama client). Fall back to plain
+        # chat + best-effort JSON parse if the option isn't recognized.
+        prompt = self._ATTR_EXTRACT_PROMPT + description
+        raw = ""
+        try:
+            resp = self._client.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                format="json",
+                options={"temperature": 0.1},
+            )
+            raw = (resp.get("message", {}) or {}).get("content", "") or ""
+        except TypeError:
+            # older ollama-python doesn't accept format kwarg
+            try:
+                resp = self._client.chat(
+                    model=OLLAMA_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.1},
+                )
+                raw = (resp.get("message", {}) or {}).get("content", "") or ""
+            except Exception as e:
+                print(f"[video-attrs] llama call failed: {e}")
+                return {}
+        except Exception as e:
+            print(f"[video-attrs] llama call failed: {e}")
+            return {}
+        # Parse — accept either bare JSON or JSON wrapped in ``` fences.
+        parsed = _try_parse_attributes_json(raw)
+        if not parsed:
+            print(f"[video-attrs] could not parse Llama output as JSON: "
+                  f"{raw[:200]!r}")
+            return {}
+        # Merge into sidecar without disturbing other keys.
+        try:
+            sidecar["scene_attributes"] = parsed
+            sidecar["scene_attributes_extracted_at"] = time.time()
+            with open(ivideos.sidecar_path(clip.path), "w",
+                      encoding="utf-8") as f:
+                json.dump(sidecar, f, indent=2)
+        except Exception as e:
+            print(f"[video-attrs] failed to write sidecar: {e}")
+        return parsed
+
+    @staticmethod
+    def _format_attributes_for_prompt(attrs: dict) -> str:
+        """Turn the JSON attribute dict into a compact readable block for
+        Llama. Returns '' if attrs is empty so the caller can skip the
+        section entirely. Never raises."""
+        if not attrs or not isinstance(attrs, dict):
+            return ""
+        lines: list[str] = []
+        people = attrs.get("people") or []
+        if isinstance(people, list) and people:
+            lines.append("People:")
+            for p in people:
+                if not isinstance(p, dict):
+                    continue
+                who = p.get("who") or "person"
+                bits = [str(who)]
+                top = p.get("clothing_top")
+                if top:
+                    bits.append(f"top: {top}")
+                bot = p.get("clothing_bottom")
+                if bot:
+                    bits.append(f"bottom: {bot}")
+                hair = p.get("hair")
+                if hair:
+                    bits.append(f"hair: {hair}")
+                acc = p.get("accessories") or []
+                if isinstance(acc, list) and acc:
+                    bits.append(f"accessories: {', '.join(str(a) for a in acc)}")
+                act = p.get("activity")
+                if act:
+                    bits.append(f"activity: {act}")
+                lines.append("  - " + "; ".join(bits))
+        setting = attrs.get("setting")
+        if setting:
+            lines.append(f"Setting: {setting}")
+        objects = attrs.get("objects") or []
+        if isinstance(objects, list) and objects:
+            lines.append("Objects: " + ", ".join(str(o) for o in objects))
+        colors = attrs.get("notable_colors") or []
+        if isinstance(colors, list) and colors:
+            lines.append("Notable colors: " + ", ".join(str(c) for c in colors))
+        text = attrs.get("readable_text") or []
+        if isinstance(text, list) and text:
+            lines.append("Readable text: " + ", ".join(str(t) for t in text))
+        return "\n".join(lines)
 
     def _ask_ollama(self, text: str) -> str:
             """General-purpose Ollama call. Injects summaries from the most
@@ -4534,7 +4825,7 @@ class StreamTab(QWidget):
 
         self._send_command("keep", item.get("ip"))
         self._set_row_status(row, "kept")
-       
+
         # ── face recognition: process keyframes in a worker thread ────
         # Only fires when iris_fusion is loaded and DeepFace is ready.
         # Safe to skip if not — the clip is still kept/deleted normally.
