@@ -4982,6 +4982,13 @@ class StreamTab(QWidget):
                 daemon=True,
                 name="ClipReconcile",
             ).start()
+            # ── M6: location inference + event-boundary detection ─────────
+            threading.Thread(
+                target=self._detect_event_and_location,
+                args=(filepath, item.get("received_at")),
+                daemon=True,
+                name="ClipEventLoc",
+            ).start()
 
     def _process_clip_for_faces(self, filepath: str) -> None:
         """Worker thread: extract 1 keyframe/sec from a received AVI clip
@@ -5095,6 +5102,99 @@ class StreamTab(QWidget):
                           f"{os.path.basename(filepath)}")
         except Exception as e:
             print(f"[reconcile] failed for "
+                  f"{os.path.basename(filepath)}: {e}")
+
+    def _detect_event_and_location(self, filepath: str,
+                                   received_at=None) -> None:
+        """Worker thread (M6 §6.3 / §6.5): infer this clip's location via the
+        OCR → Wi-Fi SSID → ip-api chain, write a .location.json sidecar, then
+        run the clip through the EventBoundaryDetector to decide whether it
+        continues the current event or opens a new one. Mirrors the existing
+        clip workers: fully guarded, never breaks the receive/keep flow."""
+        # Normalise the arrival time to epoch seconds for the detector.
+        try:
+            import datetime as _dt
+            if hasattr(received_at, "timestamp"):
+                received_at = received_at.timestamp()
+            elif received_at is None:
+                received_at = None
+        except Exception:
+            received_at = None
+
+        # Sample a few frames once, reused for OCR (location) below.
+        frames = []
+        try:
+            if ivideos is not None:
+                frames = ivideos._sample_frames_spread(filepath, 4)
+        except Exception:
+            frames = []
+
+        fusion = None
+        if iris_fusion is not None:
+            try:
+                fusion = iris_fusion.get_fusion()
+            except Exception:
+                fusion = None
+
+        # ── location inference (OCR → Wi-Fi SSID → ip-api) ────────────────
+        location = None
+        try:
+            import location_phase8            # type: ignore
+            location = location_phase8.resolve_location(frames, fusion)
+            if location:
+                location_phase8.save_location_sidecar(filepath, location)
+                self._log(f"[location] {os.path.basename(filepath)} → "
+                          f"{location.get('location','?')} "
+                          f"(source: {location.get('source','?')})")
+                # Center the Location tab on the fix if the map is available.
+                try:
+                    tab = getattr(self, "location_tab", None)
+                    if (tab is not None and hasattr(tab, "center_on")
+                            and location.get("lat") is not None
+                            and location.get("lon") is not None):
+                        tab.center_on((location["lat"], location["lon"]))
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[location] inference failed for "
+                  f"{os.path.basename(filepath)}: {e}")
+
+        # ── event boundary detection ─────────────────────────────────────
+        try:
+            import event_boundary_phase9 as ebd     # type: ignore
+            enabled = True
+            try:
+                import config_phase9 as _cfg         # type: ignore
+                enabled = bool(getattr(_cfg, "EVENT_BOUNDARY_ENABLED", True))
+            except Exception:
+                pass
+            if not enabled:
+                return
+            # Best-effort people + scene description from the clip's video
+            # sidecar (written by _process_clip_for_faces / describe()).
+            people, scene = [], ""
+            try:
+                if ivideos is not None:
+                    meta = ivideos.read_sidecar(filepath)
+                    people = list(meta.get("people_names", []) or [])
+                    scene = meta.get("scene_description", "") or ""
+            except Exception:
+                pass
+            det = ebd.get_detector()
+            dec = det.observe(
+                filepath,
+                received_at=received_at,
+                people_names=people,
+                face_ids=people,
+                location=location,
+                scene_description=scene,
+            )
+            if dec.is_new_event:
+                self._log(f"[event] new event {dec.event_id} — {dec.reason}")
+            elif dec.status in ("boundary_pending", "in_transit"):
+                self._log(f"[event] {dec.status}: {dec.reason}")
+        except Exception as e:
+            print(f"[event] detection failed for "
                   f"{os.path.basename(filepath)}: {e}")
 
 

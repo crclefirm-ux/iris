@@ -238,6 +238,19 @@ _SCENE_PROMPT = (
     "no headers, no bullet points, plain prose only."
 )
 
+# ── M6 §6.5: OCR prompt for location inference ───────────────────────────
+# Reads signage / storefront / menu text from a few frames and returns the
+# single most likely VENUE / PLACE name, which location_phase8.resolve_location
+# treats as the highest-priority location source (OCR venue > Wi-Fi > IP).
+_OCR_PROMPT = (
+    "These images are frames from a wearable camera. Read any visible text: "
+    "signage, storefront names, menus, street signs, or venue names. Then "
+    "answer with ONLY the single most likely name of the place/venue the "
+    "wearer is at (for example: 'Yaffa Coffee House', 'Whole Foods Market', "
+    "'Gate B12'). If there is no readable place or venue name, answer exactly "
+    "NONE. No preamble, no quotes, no explanation — just the name or NONE."
+)
+
 
 class _LlavaInference:
     def __init__(self, url: str, model: str):
@@ -354,6 +367,60 @@ class _LlavaInference:
             return str(text).strip()
         except Exception:
             return ""
+
+    def read_signage(self, images_bgr: list) -> str:
+        """OCR helper for location inference (§6.5). Send several frames and
+        get back the single most likely venue/place name read from signage,
+        or '' (LLaVA answers NONE when there is no readable place). Same
+        encode/serialize pattern as describe_frames(); blocking — caller runs
+        this on a background thread."""
+        client = self._ensure_client()
+        if client is None or not images_bgr:
+            return ""
+        try:
+            import cv2, base64
+            imgs_b64 = []
+            for img in images_bgr:
+                ok, buf = cv2.imencode(
+                    ".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    imgs_b64.append(base64.b64encode(buf.tobytes())
+                                    .decode("ascii"))
+            if not imgs_b64:
+                return ""
+        except Exception as e:
+            print(f"[llava] ocr image encode failed: {e}")
+            return ""
+        with self._lock:
+            try:
+                resp = client.chat(
+                    model=self.model,
+                    messages=[{
+                        "role": "user",
+                        "content": _OCR_PROMPT,
+                        "images": imgs_b64,
+                    }],
+                )
+            except Exception as e:
+                print(f"[llava] ocr inference failed: {e}")
+                return ""
+        try:
+            msg = resp["message"] if isinstance(resp, dict) \
+                else getattr(resp, "message", None)
+            if isinstance(msg, dict):
+                text = msg.get("content", "") or ""
+            else:
+                text = getattr(msg, "content", "") or ""
+            text = str(text).strip()
+        except Exception:
+            return ""
+        text = text.replace("\n", " ").replace("\r", " ").strip()
+        text = text.strip(" \"'.\u201c\u201d")
+        if text.upper() in {"NONE", "N/A", "UNKNOWN", ""}:
+            return ""
+        if len(text) > 80:
+            text = text[:77] + "\u2026"
+        return text
 
 
 # ── result types ────────────────────────────────────────────────────────
@@ -1061,6 +1128,19 @@ class PeopleFusion:
             return self.llava.describe_frames(frames)
         except Exception as e:
             print(f"[llava] describe_scene failed: {e}")
+            return ""
+
+    # ── M6 §6.5: OCR signage → location name (used by location_phase8) ───
+    def read_signage(self, frames: list) -> str:
+        """Public entry point for location_phase8.resolve_location(): read
+        signage/venue text from several clip frames via LLaVA and return the
+        venue name, or '' if none is readable. Reuses the same warmed-up
+        LLaVA client as role inference / scene description. Blocking — callers
+        run it on a background thread."""
+        try:
+            return self.llava.read_signage(frames)
+        except Exception as e:
+            print(f"[llava] read_signage failed: {e}")
             return ""
 
     # ── face-side folder hook ────────────────────────────────────────────

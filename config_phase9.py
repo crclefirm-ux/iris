@@ -93,3 +93,29 @@ ESP32_CAMERA_WAIT_SECONDS = 20.0
 
 # --- Photos storage ---
 PHOTOS_DIR = r"C:\audio_stream_glass_version\photos"
+
+# ── LLaVA vision model (new for M6: role/scene/OCR share one client) ──────
+# iris_fusion reads this; kept explicit here so scene description + OCR use a
+# known model. Any Ollama LLaVA tag works (e.g. "llava:7b", "llava:13b").
+OLLAMA_LLAVA_MODEL   = "llava:7b"
+
+# ── M6 §6.3 Event Boundary Detection ──────────────────────────────────────
+EVENT_BOUNDARY_ENABLED     = True
+EVENTS_DIR                 = r"C:\audio_stream_glass_version\data\events"
+EVENT_MIN_CONFIRM_CLIPS    = 2       # consecutive confirming clips before firing
+EVENT_MAX_GAP_SECONDS      = 300.0   # >300s between clips → force boundary
+EVENT_SAME_THRESHOLD       = 0.75    # combined score > this  → same event
+EVENT_NEW_THRESHOLD        = 0.50    # combined score < this  → boundary candidate
+# Signal weights (must reflect §6.3; renormalised over whichever are present).
+EVENT_W_VISUAL             = 0.40    # LLaVA/MiniLM scene-embedding cosine
+EVENT_W_AUDIO              = 0.30    # librosa MFCC cosine
+EVENT_W_FACE               = 0.20    # Jaccard of face-ID sets
+EVENT_W_MOTION             = 0.10    # optical-flow mean-magnitude delta
+
+# ── M6 §6.5 Location inference (OCR → Wi-Fi SSID → ip-api) ─────────────────
+LOCATION_OCR_ENABLED       = True    # Source 1: LLaVA OCR of signage (primary)
+LOCATION_WIFI_ENABLED      = True    # Source 2: connected Wi-Fi SSID
+LOCATION_IP_ENABLED        = True    # Source 3: ip-api.com fallback
+# Optional: map known SSIDs to friendly venue/home names.
+#   e.g. {"Yaffa_Guest": "Yaffa Coffee House", "HomeNet": "Home"}
+SSID_LOCATION_MAP          = {}
