@@ -43,10 +43,14 @@ class Session:
     updated: float
     title: str = "new session"
     messages: list = field(default_factory=list)   # [{role, content, ts}]
+    # Optional context used for the rich sidebar label "location · person · HH:MM".
+    location: str = ""                              # venue / city, if known
+    people: list = field(default_factory=list)      # person names, if known
 
     def to_dict(self) -> dict:
         return {"id": self.id, "created": self.created, "updated": self.updated,
-                "title": self.title, "messages": self.messages}
+                "title": self.title, "messages": self.messages,
+                "location": self.location, "people": self.people}
 
     @staticmethod
     def from_dict(d: dict) -> "Session":
@@ -56,6 +60,8 @@ class Session:
             updated=float(d.get("updated") or time.time()),
             title=d.get("title") or "new session",
             messages=d.get("messages") or [],
+            location=d.get("location") or "",
+            people=list(d.get("people") or []),
         )
 
     def when(self) -> datetime:
@@ -119,6 +125,28 @@ class SessionStore:
         # until there's at least one user message.
         if any(m.get("role") == "user" for m in s.messages):
             self._save(s)
+
+    def set_context(self, sid: str, location: Optional[str] = None,
+                    people: Optional[list] = None) -> bool:
+        """Attach location / people to a session so the sidebar can render the
+        "location · person · HH:MM" label. Returns True if anything changed."""
+        s = self._sessions.get(sid)
+        if s is None:
+            return False
+        changed = False
+        if location:
+            loc = str(location).strip()
+            if loc and loc != s.location:
+                s.location = loc
+                changed = True
+        if people:
+            ppl = [str(p).strip() for p in people if str(p).strip()]
+            if ppl and ppl != s.people:
+                s.people = ppl
+                changed = True
+        if changed:
+            self._save(s)
+        return changed
 
     def delete(self, sid: str) -> None:
         self._sessions.pop(sid, None)

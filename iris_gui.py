@@ -889,7 +889,19 @@ class ChatTab(QWidget):
             f"QPushButton:hover {{ background: rgba({_rgb(ACCENT)},0.20); }}")
         new_btn.clicked.connect(self._new_session)
         lay.addWidget(new_btn)
-        lay.addSpacing(10)
+        lay.addSpacing(8)
+        self._sidebar_search = QLineEdit()
+        self._sidebar_search.setPlaceholderText("search sessions\u2026")
+        self._sidebar_search.setClearButtonEnabled(True)
+        self._sidebar_search.setFixedHeight(30)
+        self._sidebar_search.setStyleSheet(
+            "QLineEdit {"
+            f"color:{TEXT_PRIMARY}; background: rgba(255,255,255,0.05);"
+            f"border:1px solid {GLASS_BORDER_SOFT}; border-radius:9px;"
+            f"padding:2px 10px; font-family:'{FONT_SANS}'; font-size:11px; }}")
+        self._sidebar_search.textChanged.connect(self._on_sidebar_search)
+        lay.addWidget(self._sidebar_search)
+        lay.addSpacing(8)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -922,17 +934,27 @@ class ChatTab(QWidget):
         groups = (self._sessions.grouped(exclude=None)
                   if self._sessions is not None else [])
         active_id = self._session.id if self._session is not None else None
+        query = getattr(self, "_sidebar_query", "")
         if not groups:
             lay.insertWidget(0, self._section("TODAY"))
             lay.insertWidget(1, self._session_label("new session", active=True))
             return
         idx = 0
+        any_shown = False
         for label, sessions in groups:
+            visible = [s for s in sessions if self._session_matches(s, query)]
+            if not visible:
+                continue
             lay.insertWidget(idx, self._section(label)); idx += 1
-            for s in sessions:
-                row = self._session_label(s.title, active=(s.id == active_id),
-                                          sid=s.id)
+            for s in visible:
+                row = self._session_label(self._format_session_label(s),
+                                          active=(s.id == active_id), sid=s.id)
                 lay.insertWidget(idx, row); idx += 1
+                any_shown = True
+        if not any_shown:
+            lay.insertWidget(0, self._section("SEARCH"))
+            lay.insertWidget(1, self._session_label(
+                "no matches" if query else "new session", active=not query))
     def _section(self, text: str) -> QLabel:
         lbl = QLabel(text.upper())
         lbl.setStyleSheet(
@@ -957,6 +979,139 @@ class ChatTab(QWidget):
         if sid is not None:
             btn.clicked.connect(lambda _=False, i=sid: self._load_session(i))
         return btn
+
+    # ── sidebar search + rich labels (M8, Tab 1) ────────────────────────
+    def _on_sidebar_search(self, text: str) -> None:
+        self._sidebar_query = (text or "").strip().lower()
+        self._refresh_sidebar()                       # instant local filter
+        self._schedule_memory_search(self._sidebar_query)
+
+    def _session_matches(self, s, query: str) -> bool:
+        """Match a session against the sidebar query. Searches (1) the
+        session title, location and people, (2) what was actually SAID in the
+        chat (its message contents), and (3) transcript/memory hits from
+        ChromaDB for this query (see _run_memory_search) — so a session
+        surfaces even when the words appear only in the recorded transcript."""
+        if not query:
+            return True
+        parts = [
+            getattr(s, "title", "") or "",
+            getattr(s, "location", "") or "",
+            " ".join(getattr(s, "people", []) or []),
+        ]
+        for m in (getattr(s, "messages", []) or []):
+            c = m.get("content") if isinstance(m, dict) else None
+            if c:
+                parts.append(str(c))
+        if query in " ".join(parts).lower():
+            return True
+        # ChromaDB reach: this session's people/location matched a transcript
+        # that semantically matches the query.
+        hits = getattr(self, "_memory_hits", None)
+        if hits:
+            fields = [(getattr(s, "location", "") or "").lower()]
+            fields += [str(n).lower() for n in (getattr(s, "people", []) or [])]
+            if any(f and f in hits for f in fields):
+                return True
+        return False
+
+    # ── ChromaDB-backed sidebar search (M8, Tab 1) ──────────────────────
+    def _schedule_memory_search(self, query: str) -> None:
+        """Debounce hitting ChromaDB — only search memory once typing pauses,
+        never on every keystroke."""
+        timer = getattr(self, "_mem_search_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._run_memory_search)
+            self._mem_search_timer = timer
+        self._pending_mem_query = query
+        if not query or len(query) < 2:
+            self._memory_hits = set()
+            timer.stop()
+            return
+        timer.start(350)
+
+    def _run_memory_search(self) -> None:
+        """Query ChromaDB transcripts for the current search text on a worker
+        thread, collect the people/locations of the matching segments, then
+        refresh the sidebar on the GUI thread. Never blocks the UI; degrades
+        silently if the memory store isn't available."""
+        query = getattr(self, "_pending_mem_query", "")
+        if not query or len(query) < 2:
+            return
+
+        def work():
+            hits = set()
+            try:
+                import iris_memory                        # type: ignore
+                mem = iris_memory.get_memory()
+                recs = mem.search_semantic(query, limit=12)
+                for r in recs:
+                    dist = getattr(r, "distance", 0.0)
+                    if dist is not None and dist > 0.9:    # drop weak matches
+                        continue
+                    for n in (getattr(r, "people_names", []) or []):
+                        if n:
+                            hits.add(str(n).lower())
+                    loc = (getattr(r, "location", "") or "").strip().lower()
+                    if loc:
+                        hits.add(loc)
+            except Exception as e:
+                print(f"[sidebar] memory search failed: {e}")
+
+            def apply():
+                # Ignore stale results if the query moved on.
+                if getattr(self, "_sidebar_query", "") != query:
+                    return
+                self._memory_hits = hits
+                self._refresh_sidebar()
+            self._call_main(apply)
+
+        threading.Thread(target=work, daemon=True,
+                         name="SidebarMemSearch").start()
+
+    def _format_session_label(self, s) -> str:
+        """Blueprint sidebar label: "location · person · HH:MM". Falls back to
+        the session title when no location/person context is known yet."""
+        try:
+            when = s.when().strftime("%H:%M")
+        except Exception:
+            when = ""
+        loc = (getattr(s, "location", "") or "").strip().lower()
+        people = getattr(s, "people", None) or []
+        person = (str(people[0]).strip().lower() if people else "")
+        parts = [p for p in (loc, person) if p]
+        if parts:
+            parts.append(when)
+            return " · ".join(p for p in parts if p)
+        title = (getattr(s, "title", "") or "session").strip()
+        return f"{title} · {when}" if when else title
+
+    def _update_session_context(self) -> None:
+        """Attach location / people to the current session so its sidebar row
+        shows the rich label. Cheap + non-blocking: uses only already-known
+        context (active clip/recording, last answered location)."""
+        if self._sessions is None or self._session is None:
+            return
+        people = None
+        vid = getattr(self, "_active_video", None)
+        if vid is not None and getattr(vid, "people_names", None):
+            people = [n for n in vid.people_names if n]
+        if people is None:
+            rec = getattr(self, "_active", None)
+            if rec is not None:
+                ppl = getattr(rec, "people", None) or getattr(rec, "speakers", None)
+                if ppl:
+                    people = [str(n) for n in ppl if n]
+        location = getattr(self, "_last_location_name", None)
+        try:
+            changed = self._sessions.set_context(
+                self._session.id, location=location, people=people)
+        except Exception:
+            changed = False
+        if changed:
+            self._refresh_sidebar()
     def _new_session(self) -> None:
         if self._sessions is not None:
             self._session = self._sessions.new_session()
@@ -964,9 +1119,15 @@ class ChatTab(QWidget):
         self._active = None
         self._active_photo = None
         self._pending_pick = None
+        self._suggest_topic = None
+        self._last_location_name = None
         self._clear_log()
         self._init_ollama()
         self._refresh_sidebar()
+        try:
+            self._refresh_suggestions()
+        except Exception:
+            pass
     def _load_session(self, sid: str) -> None:
         if self._sessions is None:
             return
@@ -1032,14 +1193,11 @@ class ChatTab(QWidget):
         self.chat_log.addStretch(1)
         self.scroll.setWidget(self._log_holder)
         lay.addWidget(self.scroll, 1)
-        chips = QHBoxLayout()
-        chips.setContentsMargins(0, 6, 0, 6)
-        chips.addWidget(SuggestionChip(pane, "what's in my last recording?",
-                                       self._on_chip))
-        chips.addSpacing(8)
-        chips.addWidget(SuggestionChip(pane, "summarize today", self._on_chip))
-        chips.addStretch(1)
-        lay.addLayout(chips)
+        self._chips_pane = pane
+        self._chips_lay = QHBoxLayout()
+        self._chips_lay.setContentsMargins(0, 6, 0, 6)
+        lay.addLayout(self._chips_lay)
+        self._refresh_suggestions()
         input_bar = GlassFrame(pane, radius=22, blur=22, dy=5, shadow_alpha=150)
         input_bar.setFixedHeight(54)
         ib = QHBoxLayout(input_bar)
@@ -1195,6 +1353,37 @@ class ChatTab(QWidget):
     def _on_chip(self, text: str) -> None:
         self.input.setText(text)
         self.input.setFocus()
+
+    # ── context-aware follow-up suggestions (M8, Tab 1) ─────────────────
+    def _suggestion_labels(self) -> list:
+        """2-3 follow-up prompts chosen from the current chat context: the
+        active video clip, active recording, or a just-answered location
+        question. Falls back to a sensible default set."""
+        if getattr(self, "_active_video", None) is not None:
+            return ["who was in it?", "where was this?", "what were they doing?"]
+        if getattr(self, "_active", None) is not None:
+            return ["summarize this", "who was talking?", "what did we decide?"]
+        if getattr(self, "_suggest_topic", None) == "location":
+            return ["what did I do there?", "who was I with?",
+                    "how long was I there?"]
+        return ["what's in my last recording?", "summarize today",
+                "where am I right now?"]
+
+    def _refresh_suggestions(self) -> None:
+        """Rebuild the chip row above the input bar from the latest context."""
+        lay = getattr(self, "_chips_lay", None)
+        pane = getattr(self, "_chips_pane", None)
+        if lay is None or pane is None:
+            return
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for label in self._suggestion_labels()[:3]:
+            lay.addWidget(SuggestionChip(pane, label, self._on_chip))
+            lay.addSpacing(8)
+        lay.addStretch(1)
     # ══════════════════════════════════════════════════════════════════════
     # Routing — pending picks first, then the iris_query classifier.
     # ══════════════════════════════════════════════════════════════════════
@@ -1822,6 +2011,14 @@ class ChatTab(QWidget):
         self.busy = False
         self.status_dot.setStyleSheet(
             f"color:{ACCENT}; background:transparent; border:none; font-size:13px;")
+        try:
+            self._refresh_suggestions()
+        except Exception:
+            pass
+        try:
+            self._update_session_context()
+        except Exception:
+            pass
         QTimer.singleShot(0, self._scroll_to_bottom)
     # ── Recordings access (mirror audio tab, merge duplicate rows) ───────
     def _all_recordings(self) -> list[Recording]:
@@ -2991,6 +3188,8 @@ class ChatTab(QWidget):
         city = (loc.get("city") or "").strip()
         if city and city.lower() not in name.lower():
             extra = f" ({city})"
+        self._suggest_topic = "location"
+        self._last_location_name = name
         return f"You're currently at {name}{extra}. Determined from {src_human}."
 
     def _answer_video_question(self, text: str) -> str:
