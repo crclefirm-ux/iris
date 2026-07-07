@@ -199,10 +199,27 @@ class _UnifiedChatClient:
         self._cache_lock = threading.Lock()
         # For AboutSystemTab: which provider served the most recent call
         self._last_provider: str = "ollama"
+        # --- IRIS cloud-provider feature: ADD ---
+        # One-shot notice consumed by ChatTab's model-pill poller. Set
+        # when a cloud call fails and we fall back to local Ollama; the
+        # chat UI then surfaces it as a visible ⚠ warning so the user
+        # sees why their key didn't route the message.
+        self._last_fallback: str = ""
+        self._fallback_lock = threading.Lock()
+        # --- end ADD ---
 
     @property
     def last_provider(self) -> str:
         return self._last_provider
+
+    # --- IRIS cloud-provider feature: ADD ---
+    def pop_fallback_notice(self) -> str:
+        """Consume the last cloud-fallback notice (called by ChatTab's
+        model-pill poller). Returns '' if none pending."""
+        with self._fallback_lock:
+            note, self._last_fallback = self._last_fallback, ""
+        return note
+    # --- end ADD ---
 
     # ── Public API — Ollama-shaped .chat() ────────────────────────────────
     def chat(self, model: str, messages: list, **kwargs) -> dict:
@@ -224,6 +241,16 @@ class _UnifiedChatClient:
             return {"message": {"content": text},
                     "_iris_provider": provider}
         except Exception as e:
+            # --- IRIS cloud-provider feature: ADD ---
+            # Record the failure so ChatTab can show a ⚠ badge on the
+            # answering message. Short-form (first 200 chars) so the
+            # chat doesn't get flooded with SDK tracebacks.
+            err_short = str(e).strip().splitlines()[0][:200] if str(e) else ""
+            with self._fallback_lock:
+                self._last_fallback = (
+                    f"{provider} call failed ({err_short})"
+                    if err_short else f"{provider} call failed")
+            # --- end ADD ---
             print(f"[cloud] {provider} call failed ({e}) — "
                   f"falling back to local Ollama")
             return self._call_ollama(model, messages, **kwargs)
@@ -1473,6 +1500,17 @@ class ChatTab(QWidget):
         header.addWidget(rec_pill)
         header.addSpacing(6)
         header.addWidget(face_pill)
+        # --- IRIS cloud-provider feature: ADD ---
+        # Live indicator of which provider will handle the next chat call.
+        # Polled every ~1.5s from iris_api_keys.json so it stays in sync
+        # with the About System tab (or with any external edits to that
+        # file). See _refresh_model_pill / _start_model_pill_poll below.
+        header.addSpacing(6)
+        self._model_pill = Pill(pane, "local · llama3.2", TEXT_DIM)
+        header.addWidget(self._model_pill)
+        self._last_seen_provider: str = "ollama"
+        self._last_seen_model: str = OLLAMA_MODEL
+        # --- end ADD ---
         lay.addLayout(header)
         lay.addSpacing(8)
         self.scroll = QScrollArea(pane)
@@ -1569,6 +1607,114 @@ class ChatTab(QWidget):
                 pills=[("voice match", BADGE_VOICE_FG)], log=False)
         except Exception as exc:
             self._append_iris(f"(could not connect to Ollama: {exc})", log=False)
+        # --- IRIS cloud-provider feature: ADD ---
+        # Start the model-pill poller AFTER the session-start message so
+        # the first pill refresh doesn't fire before the greeting.
+        self._start_model_pill_poll()
+        # --- end ADD ---
+
+    # --- IRIS cloud-provider feature: ADD ---
+    # Live model-indicator poller. Reads iris_api_keys.json every ~1.5s,
+    # updates the header pill, and emits a chat message whenever the
+    # provider actually changes so the switch is visible. Also surfaces
+    # cloud-to-ollama fallbacks that happened during background chat
+    # calls (via _UnifiedChatClient.pop_fallback_notice).
+    _POLL_MODEL_PILL_MS = 1500
+
+    _PROVIDER_DISPLAY = {
+        "ollama":    ("local",     TEXT_DIM),
+        "openai":    ("openai",    COLOR_STATUS_ON),
+        "anthropic": ("anthropic", COLOR_STATUS_ON),
+        "google":    ("gemini",    COLOR_STATUS_ON),
+        "azure":     ("azure",     COLOR_STATUS_ON),
+    }
+
+    def _start_model_pill_poll(self) -> None:
+        if not hasattr(self, "_model_pill"):
+            return
+        self._model_pill_timer = QTimer(self)
+        self._model_pill_timer.timeout.connect(self._refresh_model_pill)
+        self._model_pill_timer.start(self._POLL_MODEL_PILL_MS)
+        # Initial sync so the pill shows the right value from the start.
+        QTimer.singleShot(100, self._refresh_model_pill)
+
+    def _resolve_current_model(self) -> tuple:
+        """Return (provider_name, model_name) for the NEXT chat call.
+        Reads iris_api_keys.json fresh every time so it stays in sync with
+        the About System tab / any external edits to that file."""
+        try:
+            keys = _read_api_keys_file()
+            provider, _ = _resolve_provider(keys)
+        except Exception:
+            provider = "ollama"
+            keys = {}
+        if provider == "ollama":
+            return ("ollama", OLLAMA_MODEL)
+        model = (str(keys.get(f"{provider}_model", "") or "").strip()
+                 or _CLOUD_MODEL_DEFAULTS.get(provider, OLLAMA_MODEL))
+        return (provider, model)
+
+    def _refresh_model_pill(self) -> None:
+        """Update the pill; announce a switch in chat if the provider or
+        model changed since the last poll. Also surface any pending
+        cloud-fallback notice from _UnifiedChatClient so the user sees
+        when a request quietly went to Ollama after a cloud failure."""
+        if not hasattr(self, "_model_pill"):
+            return
+        provider, model = self._resolve_current_model()
+        # Update the pill text + color
+        label, color = self._PROVIDER_DISPLAY.get(
+            provider, ("local", TEXT_DIM))
+        # Trim overly long model names for pill display (keep the tail).
+        short_model = model if len(model) <= 24 else model[:11] + "…" + model[-11:]
+        self._model_pill.setText(f"{label} · {short_model}")
+        self._model_pill.setStyleSheet(
+            f"color:{color};"
+            f"background: rgba({_rgb(color)},0.12);"
+            f"border: 1px solid rgba({_rgb(color)},0.30);"
+            f"border-radius: 8px; padding: 2px 9px;"
+            f"font-family:'{FONT_MONO}','Consolas',monospace; font-size:10px;")
+        # Announce a provider/model change in chat exactly once per change
+        prior_provider = getattr(self, "_last_seen_provider", "ollama")
+        prior_model = getattr(self, "_last_seen_model", OLLAMA_MODEL)
+        if (provider != prior_provider) or (model != prior_model):
+            self._last_seen_provider = provider
+            self._last_seen_model = model
+            # Skip the first announcement — the session-start message
+            # already welcomes the user; announce only real transitions.
+            if hasattr(self, "_pill_first_refresh_done"):
+                if provider == "ollama":
+                    body = (f"Switched to local Ollama · {model}. "
+                            f"Cloud provider disabled or no key on file.")
+                else:
+                    display_name = {
+                        "openai": "OpenAI", "anthropic": "Anthropic",
+                        "google": "Google Gemini", "azure": "Azure OpenAI",
+                    }.get(provider, provider)
+                    body = (f"Switched to {display_name} · {model}. "
+                            f"All chat messages will use this model until "
+                            f"you clear the key or uncheck the toggle in "
+                            f"About System.")
+                try:
+                    self._append_iris(body, log=False)
+                except Exception:
+                    pass
+            self._pill_first_refresh_done = True
+        # Cloud fallback notification (e.g. bad key, rate limit, network)
+        try:
+            notice = None
+            if self._client is not None and hasattr(
+                    self._client, "pop_fallback_notice"):
+                notice = self._client.pop_fallback_notice()
+            if notice:
+                self._append_iris(
+                    f"⚠ {notice} — this message was answered by local "
+                    f"Ollama instead. Check your key in About System.",
+                    log=False)
+        except Exception:
+            pass
+    # --- end ADD ---
+
     # ── Message rendering ────────────────────────────────────────────────
     def _append_iris(self, body: str,
                      pills: list[tuple[str, str]] | None = None,
@@ -8334,8 +8480,29 @@ class AboutSystemTab(QWidget):
         text = text.strip()
         if text:
             self._api_keys[provider_id] = text
+            # --- IRIS cloud-provider feature: ADD ---
+            # Auto-enable cloud routing when a key is entered. Presence of
+            # a key is the trigger — no separate opt-in needed. If the
+            # user unchecks the toggle manually, that still forces local.
+            if (hasattr(self, "_cloud_toggle")
+                    and not self._cloud_toggle.isChecked()):
+                self._cloud_toggle.blockSignals(True)
+                self._cloud_toggle.setChecked(True)
+                self._cloud_toggle.blockSignals(False)
+            # --- end ADD ---
         else:
             self._api_keys.pop(provider_id, None)
+            # --- IRIS cloud-provider feature: ADD ---
+            # If clearing this key leaves no cloud keys at all, flip cloud
+            # off so the pill / status reads correctly.
+            if not any(self._api_keys.get(p) for p in
+                       ("openai", "anthropic", "google", "azure")):
+                if (hasattr(self, "_cloud_toggle")
+                        and self._cloud_toggle.isChecked()):
+                    self._cloud_toggle.blockSignals(True)
+                    self._cloud_toggle.setChecked(False)
+                    self._cloud_toggle.blockSignals(False)
+            # --- end ADD ---
         self._save_keys_to_disk()
 
     def _load_keys_from_disk(self) -> dict:
