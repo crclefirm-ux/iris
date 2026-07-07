@@ -45,6 +45,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QScrollArea, QGraphicsDropShadowEffect,
     QStackedWidget, QFileDialog, QSizePolicy, QSizeGrip,
     QGridLayout, QTextEdit, QComboBox, QDialog,
+    QProgressBar, QCheckBox,   # ── IRIS about-system feature: ADD ──
 )
 # Optional: real map needs PyQt6-WebEngine. Degrades to a glass list if absent.
 try:
@@ -7552,6 +7553,576 @@ class PhotosTab(QWidget):
     def showEvent(self, event) -> None:
         self.refresh()
         super().showEvent(event)
+# ═════════════════════════════════════════════════════════════════════════════
+# --- IRIS about-system feature: ADD ---
+# M8 System Dashboard — CPU/RAM/disk telemetry, live model load state,
+# processing queue depths, and an API-keys panel for future cloud-provider
+# swap. Read-only — nothing here writes to the audio/video/memory pipelines.
+#
+# Data sources (all best-effort, all degrade gracefully if missing):
+#   * psutil                → CPU%, RAM used/total, disk free, process RSS
+#   * Ollama /api/ps        → which chat/vision models are actually resident
+#   * controller.transcriber / diarizer / summarizer → queue depths
+#   * sys.modules           → DeepFace / SpeechBrain presence heuristic
+#
+# API keys are persisted to iris_api_keys.json in the working directory.
+# Storing a key merely saves it; the "Use cloud provider" toggle also just
+# saves the preference. Actually routing chat traffic to the cloud is a
+# separate ChatTab wiring change flagged inline as future work.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _fmt_uptime(secs: float) -> str:
+    """1234 -> '20m 34s', 5000 -> '1h 23m'. Always <= 8 chars."""
+    secs = int(max(0, secs))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m {secs % 60:02d}s"
+    if secs < 86400:
+        return f"{secs // 3600}h {(secs % 3600) // 60:02d}m"
+    return f"{secs // 86400}d {(secs % 86400) // 3600:02d}h"
+
+
+class AboutSystemTab(QWidget):
+    """Live system-monitoring dashboard. See module-level comment above."""
+
+    _POLL_STATS_MS   = 2000    # CPU / RAM / disk poll
+    _POLL_MODELS_MS  = 5000    # Ollama /api/ps poll
+    _POLL_QUEUES_MS  = 1000    # controller queue-depth poll (cheap)
+    _KEYS_FILE       = "iris_api_keys.json"
+
+    _PROVIDERS = [
+        ("openai",    "OpenAI",           "sk-... (paste OpenAI key)"),
+        ("anthropic", "Anthropic",        "sk-ant-... (paste Anthropic key)"),
+        ("google",    "Google (Gemini)",  "AIza... (paste Gemini key)"),
+        ("azure",     "Azure OpenAI",     "paste Azure OpenAI key"),
+    ]
+
+    _MODEL_ROWS = [
+        ("whisper",     "Whisper · faster-whisper medium.en"),
+        ("speechbrain", "SpeechBrain · ECAPA-TDNN diarizer"),
+        ("deepface",    "DeepFace · ArcFace face recognition"),
+        ("llama",       "Llama 3.2 3B · Ollama"),
+        ("llava",       "LLaVA 7B · Ollama vision"),
+    ]
+
+    _QUEUE_ROWS = [
+        ("transcribe", "transcription"),
+        ("diarize",    "diarization"),
+        ("summarize",  "summarization"),
+    ]
+
+    def __init__(self, parent, controller=None):
+        super().__init__(parent)
+        self.controller = controller
+        # psutil is the only optional dependency; if it's not installed the
+        # stats panel just shows a hint instead of dying.
+        self._psutil = None
+        try:
+            import psutil as _ps
+            self._psutil = _ps
+        except ImportError:
+            pass
+        self._api_keys: dict = self._load_keys_from_disk()
+        self._key_edits: dict = {}
+        self._model_rows: dict = {}
+        self._ollama_loaded: set = set()
+        self._ollama_reachable: bool = False
+        self._build()
+        self._start_timers()
+
+    # ── panel construction ────────────────────────────────────────────────
+    def _build(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }")
+        outer.addWidget(scroll)
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(4, 4, 4, 4)
+        cl.setSpacing(12)
+        scroll.setWidget(content)
+
+        cl.addWidget(self._build_system_panel())
+        cl.addWidget(self._build_models_panel())
+        cl.addWidget(self._build_keys_panel())
+        cl.addStretch(1)
+
+    def _panel_frame(self) -> "GlassFrame":
+        return GlassFrame(self, radius=16, blur=24, dy=6, shadow_alpha=120,
+                          top="rgba(255,255,255,0.06)",
+                          mid="rgba(255,255,255,0.035)",
+                          bot="rgba(255,255,255,0.02)",
+                          border=GLASS_BORDER_SOFT)
+
+    def _title(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color:{TEXT_PRIMARY}; background:transparent;"
+                          f"border:none; font-family:'{FONT_SANS}';"
+                          "font-size:15px; font-weight:700;")
+        return lbl
+
+    def _subtitle(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color:{TEXT_MUTED}; background:transparent;"
+                          f"border:none; font-family:'{FONT_SANS}';"
+                          "font-size:11px;")
+        lbl.setWordWrap(True)
+        return lbl
+
+    def _key_label(self, text: str, width: int = 140) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setFixedWidth(width)
+        lbl.setStyleSheet(f"color:{TEXT_MUTED}; background:transparent;"
+                          f"border:none; font-family:'{FONT_MONO}',"
+                          f"'Consolas',monospace; font-size:11px;")
+        return lbl
+
+    def _mono_value(self, text: str = "--") -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color:{TEXT_PRIMARY}; background:transparent;"
+                          f"border:none; font-family:'{FONT_MONO}',"
+                          f"'Consolas',monospace; font-size:11px;")
+        return lbl
+
+    def _bar_style(self) -> str:
+        return (
+            "QProgressBar {"
+            f"color: {TEXT_PRIMARY}; background: rgba(255,255,255,0.05);"
+            f"border: 1px solid {GLASS_BORDER_SOFT}; border-radius: 6px;"
+            "text-align: center;"
+            f"font-family: '{FONT_MONO}','Consolas',monospace; font-size: 10px;"
+            "}"
+            "QProgressBar::chunk {"
+            f"background-color: {ACCENT}; border-radius: 5px;"
+            "}"
+        )
+
+    # ── System load panel ─────────────────────────────────────────────────
+    def _build_system_panel(self) -> "GlassFrame":
+        frame = self._panel_frame()
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        lay.addWidget(self._title("system load"))
+
+        if self._psutil is None:
+            lay.addWidget(self._subtitle(
+                "psutil not installed — run  pip install psutil  to see CPU / "
+                "RAM / disk usage here. Other panels still work."))
+            return frame
+
+        # CPU
+        cpu_row = QHBoxLayout()
+        cpu_row.addWidget(self._key_label("cpu %"))
+        self._cpu_bar = QProgressBar()
+        self._cpu_bar.setRange(0, 100)
+        self._cpu_bar.setFixedHeight(18)
+        self._cpu_bar.setTextVisible(True)
+        self._cpu_bar.setStyleSheet(self._bar_style())
+        cpu_row.addWidget(self._cpu_bar, 1)
+        lay.addLayout(cpu_row)
+
+        # RAM
+        ram_row = QHBoxLayout()
+        ram_row.addWidget(self._key_label("ram %"))
+        self._ram_bar = QProgressBar()
+        self._ram_bar.setRange(0, 100)
+        self._ram_bar.setFixedHeight(18)
+        self._ram_bar.setTextVisible(True)
+        self._ram_bar.setStyleSheet(self._bar_style())
+        ram_row.addWidget(self._ram_bar, 1)
+        self._ram_lbl = self._mono_value()
+        self._ram_lbl.setFixedWidth(140)
+        ram_row.addWidget(self._ram_lbl)
+        lay.addLayout(ram_row)
+
+        # Disk of working directory
+        disk_row = QHBoxLayout()
+        disk_row.addWidget(self._key_label("disk (cwd)"))
+        self._disk_lbl = self._mono_value()
+        disk_row.addWidget(self._disk_lbl, 1)
+        lay.addLayout(disk_row)
+
+        # This iris process
+        proc_row = QHBoxLayout()
+        proc_row.addWidget(self._key_label("iris process"))
+        self._proc_lbl = self._mono_value()
+        proc_row.addWidget(self._proc_lbl, 1)
+        lay.addLayout(proc_row)
+
+        return frame
+
+    # ── Models + queues panel ─────────────────────────────────────────────
+    def _build_models_panel(self) -> "GlassFrame":
+        frame = self._panel_frame()
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(6)
+        lay.addWidget(self._title("models & inference queues"))
+        lay.addWidget(self._subtitle(
+            "Load status is polled every ~5s. 'idle' means the model is on "
+            "disk but not in RAM — first call will load it. 'unreachable' "
+            "means Ollama isn't answering on " + OLLAMA_URL + "."))
+
+        for mid, display in self._MODEL_ROWS:
+            row = self._make_model_row(display)
+            self._model_rows[mid] = row
+            lay.addWidget(row["widget"])
+
+        # Divider
+        div = QLabel("processing queues")
+        div.setStyleSheet(f"color:{TEXT_MUTED}; background:transparent;"
+                          f"border:none; font-family:'{FONT_SANS}';"
+                          "font-size:11px; font-weight:600; padding-top:6px;")
+        lay.addWidget(div)
+
+        for qid, display in self._QUEUE_ROWS:
+            row = self._make_model_row(display)
+            self._model_rows[f"queue_{qid}"] = row
+            lay.addWidget(row["widget"])
+
+        return frame
+
+    def _make_model_row(self, name: str) -> dict:
+        w = QWidget()
+        w.setStyleSheet("background: transparent;")
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 2, 0, 2)
+        h.setSpacing(10)
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet(f"color:{TEXT_PRIMARY}; background:transparent;"
+                               f"border:none; font-family:'{FONT_SANS}';"
+                               "font-size:12px;")
+        name_lbl.setFixedWidth(280)
+        h.addWidget(name_lbl)
+        status_lbl = QLabel("--")
+        status_lbl.setStyleSheet(f"color:{TEXT_MUTED}; background:transparent;"
+                                 f"border:none; font-family:'{FONT_MONO}',"
+                                 f"'Consolas',monospace; font-size:11px;")
+        status_lbl.setFixedWidth(100)
+        h.addWidget(status_lbl)
+        note_lbl = QLabel("")
+        note_lbl.setStyleSheet(f"color:{TEXT_DIM}; background:transparent;"
+                               f"border:none; font-family:'{FONT_SANS}';"
+                               "font-size:11px;")
+        h.addWidget(note_lbl, 1)
+        return {"widget": w, "name": name_lbl, "status": status_lbl,
+                "note": note_lbl}
+
+    def _set_model_status(self, model_id: str,
+                          status: str, note: str = "") -> None:
+        row = self._model_rows.get(model_id)
+        if row is None:
+            return
+        colors = {
+            "loaded":       COLOR_STATUS_ON,
+            "idle":         TEXT_MUTED,
+            "not loaded":   TEXT_DIM,
+            "not imported": TEXT_DIM,
+            "unreachable":  COLOR_DANGER,
+            "pending":      ACCENT,
+        }
+        # For queue rows, "0 pending" is idle-green.
+        row["status"].setText(status)
+        color = colors.get(status.split()[0] if status else "", TEXT_MUTED)
+        # numeric-only status like "3 pending" is highlighted with the accent
+        if status and status[0].isdigit():
+            color = ACCENT
+        row["status"].setStyleSheet(f"color:{color}; background:transparent;"
+                                    f"border:none; font-family:'{FONT_MONO}',"
+                                    f"'Consolas',monospace; font-size:11px;")
+        row["note"].setText(note)
+
+    # ── API keys panel ────────────────────────────────────────────────────
+    def _build_keys_panel(self) -> "GlassFrame":
+        frame = self._panel_frame()
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        lay.addWidget(self._title("api keys — cloud provider swap"))
+        lay.addWidget(self._subtitle(
+            "Optional cloud API keys, saved to iris_api_keys.json in the "
+            "working directory. Storing a key here does NOT automatically "
+            "switch IRIS off local Ollama — the toggle below only persists "
+            "the preference. Live routing is a future ChatTab wiring change."))
+
+        for pid, name, placeholder in self._PROVIDERS:
+            row_widget = QWidget()
+            row_widget.setStyleSheet("background: transparent;")
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 2, 0, 2)
+            row.setSpacing(6)
+
+            lbl = QLabel(name)
+            lbl.setFixedWidth(140)
+            lbl.setStyleSheet(f"color:{TEXT_PRIMARY}; background:transparent;"
+                              f"border:none; font-family:'{FONT_SANS}';"
+                              "font-size:12px;")
+            row.addWidget(lbl)
+
+            edit = QLineEdit()
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.setPlaceholderText(placeholder)
+            edit.setText(self._api_keys.get(pid, ""))
+            edit.setStyleSheet(
+                "QLineEdit {"
+                f"color: {TEXT_PRIMARY}; background: rgba(255,255,255,0.04);"
+                f"border: 1px solid {GLASS_BORDER_SOFT}; border-radius: 8px;"
+                f"padding: 6px 10px; font-family: '{FONT_MONO}',"
+                f"'Consolas',monospace; font-size: 11px;"
+                "}"
+                "QLineEdit:focus { "
+                f"border: 1px solid {ACCENT};"
+                " }")
+            edit.textChanged.connect(
+                lambda t, k=pid: self._on_key_changed(k, t))
+            self._key_edits[pid] = edit
+            row.addWidget(edit, 1)
+
+            show_btn = QPushButton("show")
+            show_btn.setFixedWidth(56)
+            show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            show_btn.setStyleSheet(self._small_btn_style())
+            show_btn.clicked.connect(
+                lambda _=False, e=edit, b=show_btn:
+                self._toggle_key_visibility(e, b))
+            row.addWidget(show_btn)
+
+            clear_btn = QPushButton("clear")
+            clear_btn.setFixedWidth(56)
+            clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            clear_btn.setStyleSheet(self._small_btn_style())
+            clear_btn.clicked.connect(
+                lambda _=False, e=edit, k=pid: self._clear_key(e, k))
+            row.addWidget(clear_btn)
+
+            lay.addWidget(row_widget)
+
+        # Cloud vs local toggle
+        toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(0, 6, 0, 0)
+        self._cloud_toggle = QCheckBox(
+            "Use cloud provider instead of local Ollama (preference only — "
+            "live routing requires a future ChatTab change)")
+        self._cloud_toggle.setChecked(
+            bool(self._api_keys.get("use_cloud", False)))
+        self._cloud_toggle.setStyleSheet(
+            f"QCheckBox {{ color: {TEXT_PRIMARY}; background: transparent;"
+            f"border: none; font-family: '{FONT_SANS}'; font-size: 11px; }}")
+        self._cloud_toggle.stateChanged.connect(self._save_keys_to_disk)
+        toggle_row.addWidget(self._cloud_toggle)
+        toggle_row.addStretch(1)
+        lay.addLayout(toggle_row)
+
+        return frame
+
+    def _small_btn_style(self) -> str:
+        return (
+            "QPushButton {"
+            f"color: {TEXT_MUTED}; background: rgba(255,255,255,0.04);"
+            f"border: 1px solid {GLASS_BORDER_SOFT}; border-radius: 8px;"
+            "padding: 4px 8px;"
+            f"font-family: '{FONT_MONO}','Consolas',monospace; font-size: 11px;"
+            "}"
+            "QPushButton:hover {"
+            f"color: {TEXT_PRIMARY}; background: rgba(255,255,255,0.08);"
+            "}"
+        )
+
+    def _toggle_key_visibility(self, edit: QLineEdit,
+                               btn: QPushButton) -> None:
+        if edit.echoMode() == QLineEdit.EchoMode.Password:
+            edit.setEchoMode(QLineEdit.EchoMode.Normal)
+            btn.setText("hide")
+        else:
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            btn.setText("show")
+
+    def _clear_key(self, edit: QLineEdit, provider_id: str) -> None:
+        edit.setText("")
+        self._api_keys.pop(provider_id, None)
+        self._save_keys_to_disk()
+
+    def _on_key_changed(self, provider_id: str, text: str) -> None:
+        text = text.strip()
+        if text:
+            self._api_keys[provider_id] = text
+        else:
+            self._api_keys.pop(provider_id, None)
+        self._save_keys_to_disk()
+
+    def _load_keys_from_disk(self) -> dict:
+        try:
+            if os.path.exists(self._KEYS_FILE):
+                with open(self._KEYS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            print(f"[about-system] failed to load {self._KEYS_FILE}: {e}")
+        return {}
+
+    def _save_keys_to_disk(self) -> None:
+        data = dict(self._api_keys)
+        if hasattr(self, "_cloud_toggle"):
+            data["use_cloud"] = bool(self._cloud_toggle.isChecked())
+        try:
+            with open(self._KEYS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[about-system] failed to save {self._KEYS_FILE}: {e}")
+
+    # ── Polling ──────────────────────────────────────────────────────────
+    def _start_timers(self) -> None:
+        self._stats_timer = QTimer(self)
+        self._stats_timer.timeout.connect(self._poll_stats)
+        self._stats_timer.start(self._POLL_STATS_MS)
+
+        self._queues_timer = QTimer(self)
+        self._queues_timer.timeout.connect(self._poll_queues)
+        self._queues_timer.start(self._POLL_QUEUES_MS)
+
+        self._models_timer = QTimer(self)
+        self._models_timer.timeout.connect(self._poll_models)
+        self._models_timer.start(self._POLL_MODELS_MS)
+
+        # Kick off first polls quickly so the panel isn't dashes for 5s.
+        QTimer.singleShot(150, self._poll_stats)
+        QTimer.singleShot(250, self._poll_queues)
+        QTimer.singleShot(400, self._poll_models)
+
+    def _poll_stats(self) -> None:
+        if self._psutil is None:
+            return
+        try:
+            cpu = self._psutil.cpu_percent(interval=None)
+            vmem = self._psutil.virtual_memory()
+            self._cpu_bar.setValue(int(cpu))
+            self._cpu_bar.setFormat(f"{cpu:.0f}%")
+            used_gb = vmem.used / 1e9
+            total_gb = vmem.total / 1e9
+            self._ram_bar.setValue(int(vmem.percent))
+            self._ram_bar.setFormat(f"{vmem.percent:.0f}%")
+            self._ram_lbl.setText(f"{used_gb:.1f} / {total_gb:.1f} GB")
+
+            try:
+                usage = self._psutil.disk_usage(os.getcwd())
+                free_gb = usage.free / 1e9
+                total_disk_gb = usage.total / 1e9
+                self._disk_lbl.setText(
+                    f"{free_gb:.1f} GB free  ·  {usage.percent:.0f}% used  "
+                    f"of {total_disk_gb:.0f} GB")
+            except Exception:
+                pass
+
+            try:
+                proc = self._psutil.Process()
+                rss_gb = proc.memory_info().rss / 1e9
+                uptime = time.time() - proc.create_time()
+                self._proc_lbl.setText(
+                    f"RSS {rss_gb:.2f} GB  ·  pid {proc.pid}  ·  "
+                    f"uptime {_fmt_uptime(uptime)}")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[about-system] stats poll error: {e}")
+
+    def _poll_queues(self) -> None:
+        # Controller-side model presence (Whisper / SpeechBrain / DeepFace)
+        ctrl = self.controller
+        if ctrl is not None:
+            has_whisper = bool(getattr(ctrl, "transcriber", None))
+            self._set_model_status(
+                "whisper",
+                "loaded" if has_whisper else "not loaded",
+                "async worker running" if has_whisper else "")
+            has_diar = bool(getattr(ctrl, "diarizer", None))
+            self._set_model_status(
+                "speechbrain",
+                "loaded" if has_diar else "not loaded",
+                "ecapa-tdnn embeddings" if has_diar else "")
+            deepface_ok = ("deepface" in sys.modules
+                           or "DeepFace" in sys.modules)
+            self._set_model_status(
+                "deepface",
+                "loaded" if deepface_ok else "not imported",
+                "arcface via opencv detector" if deepface_ok else
+                "no video/photo used deepface yet")
+
+            for qid, _ in self._QUEUE_ROWS:
+                worker = getattr(ctrl, {
+                    "transcribe": "transcriber",
+                    "diarize":    "diarizer",
+                    "summarize":  "summarizer",
+                }[qid], None)
+                if worker is None:
+                    self._set_model_status(f"queue_{qid}", "not loaded", "")
+                    continue
+                depth = int(getattr(worker, "queue_depth", 0) or 0)
+                if depth == 0:
+                    self._set_model_status(f"queue_{qid}", "idle",
+                                            "no pending jobs")
+                else:
+                    self._set_model_status(
+                        f"queue_{qid}",
+                        f"{depth} pending",
+                        "processing in background")
+
+    def _poll_models(self) -> None:
+        # Non-blocking: run the HTTP call off the GUI thread so a slow /
+        # unreachable Ollama can't freeze the tab. The apply step is
+        # scheduled back onto the main thread via QTimer.singleShot(0, ...).
+        threading.Thread(target=self._fetch_ollama_status,
+                         daemon=True, name="AboutSystemOllama").start()
+
+    def _fetch_ollama_status(self) -> None:
+        loaded: set = set()
+        reachable = False
+        try:
+            import urllib.request as _urlreq
+            url = OLLAMA_URL.rstrip("/") + "/api/ps"
+            with _urlreq.urlopen(url, timeout=2.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            reachable = True
+            for m in (data.get("models") or []):
+                nm = str(m.get("name") or m.get("model") or "").lower()
+                if nm:
+                    loaded.add(nm)
+        except Exception:
+            reachable = False
+        self._ollama_loaded = loaded
+        self._ollama_reachable = reachable
+        QTimer.singleShot(0, self._apply_ollama_status)
+
+    def _apply_ollama_status(self) -> None:
+        if not self._ollama_reachable:
+            self._set_model_status(
+                "llama", "unreachable",
+                f"ollama not responding at {OLLAMA_URL}")
+            self._set_model_status(
+                "llava", "unreachable",
+                f"ollama not responding at {OLLAMA_URL}")
+            return
+        loaded = self._ollama_loaded
+        llama_hit = any("llama3.2" in m or "llama3" in m for m in loaded)
+        llava_hit = any("llava" in m for m in loaded)
+        self._set_model_status(
+            "llama",
+            "loaded" if llama_hit else "idle",
+            "in RAM (4-bit quantized)" if llama_hit
+            else "on disk — loads on first chat call")
+        self._set_model_status(
+            "llava",
+            "loaded" if llava_hit else "idle",
+            "in RAM (4-bit quantized)" if llava_hit
+            else "on disk — loads on first video/scene call")
+# --- end ADD ---
 # ─────────────────────────────────────────────────────────────────────────────
 # Top tab bar — glass segmented buttons (chat / audio / location / people / stream)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7661,7 +8232,8 @@ class TitleBar(QWidget):
 # Main IRIS window — a single rounded, frameless "bubble" floating on the desktop
 # ─────────────────────────────────────────────────────────────────────────────
 class IrisApp(QWidget):
-    TAB_NAMES = ["chat", "audio", "location", "people", "stream", "photos"]
+    TAB_NAMES = ["chat", "audio", "location", "people", "stream", "photos",
+                 "about system"]   # ── IRIS about-system feature: ADD ──
     def __init__(self, controller=None):
         super().__init__()
         self.controller = controller
@@ -7771,6 +8343,12 @@ class IrisApp(QWidget):
             self.tabbar._select(0)
         self.photos = PhotosTab(self, config, on_select=_select_photo_from_gallery)
         self.stack.addWidget(self.photos)
+        # --- IRIS about-system feature: ADD ---
+        # M8 System Dashboard — CPU/RAM/model status + API keys panel.
+        # Always the last tab; index matches TAB_NAMES.
+        self.about_system = AboutSystemTab(self, controller=controller)
+        self.stack.addWidget(self.about_system)
+        # --- end ADD ---
         self.tabbar.changed.connect(self.stack.setCurrentIndex)
         self.stack.setCurrentIndex(0)
         # Bottom-right resize grip (frameless windows lose native resizing)
@@ -7838,3 +8416,4 @@ def main() -> int:
             pass
 if __name__ == "__main__":
     sys.exit(main())
+
