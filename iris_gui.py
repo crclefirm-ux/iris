@@ -483,15 +483,15 @@ ESP32_CAMERA_WAIT_SECONDS = float(_cfg("ESP32_CAMERA_WAIT_SECONDS", 20.0))
 # ─────────────────────────────────────────────────────────────────────────────
 # Palette
 # ─────────────────────────────────────────────────────────────────────────────
-BG_TOP        = "#0e1015"
-BG_MID        = "#14171e"
-BG_BOT        = "#0e1015"
-TEXT_PRIMARY  = "#e6edf3"
-TEXT_MUTED    = "#9ca3af"
-TEXT_DIM      = "#6b7280"
+BG_TOP        = "#020818"
+BG_MID        = "#050f2e"
+BG_BOT        = "#091a3d"
+TEXT_PRIMARY  = "#d0eaff"
+TEXT_MUTED    = "#8fb8f0"
+TEXT_DIM      = "#6f8fc0"
 TEXT_FAINT    = "#4b5563"
-ACCENT        = "#5eead4"
-ACCENT_HOVER  = "#2dd4bf"
+ACCENT        = "#79bbff"
+ACCENT_HOVER  = "#57a5ff"
 USER_ACCENT   = "#a78bfa"
 BADGE_FACE_FG  = "#34d399"
 BADGE_VOICE_FG = "#60a5fa"
@@ -501,14 +501,14 @@ COLOR_STATUS_ON  = "#10b981"
 COLOR_STATUS_OFF = "#6b7280"
 COLOR_DANGER     = "#ef4444"
 COLOR_RECORDING  = "#dc2626"
-GLASS_FILL_TOP = "rgba(255,255,255,0.16)"
-GLASS_FILL_MID = "rgba(255,255,255,0.06)"
-GLASS_FILL_BOT = "rgba(255,255,255,0.022)"
-GLASS_BORDER   = "rgba(255,255,255,0.11)"
-GLASS_BORDER_SOFT = "rgba(255,255,255,0.06)"
-BUBBLE_BORDER  = "rgba(255,255,255,0.18)"
+GLASS_FILL_TOP = "rgba(10,14,28,0.55)"
+GLASS_FILL_MID = "rgba(8,11,22,0.50)"
+GLASS_FILL_BOT = "rgba(6,9,18,0.48)"
+GLASS_BORDER   = "rgba(100,180,255,0.28)"
+GLASS_BORDER_SOFT = "rgba(100,180,255,0.16)"
+BUBBLE_BORDER  = "rgba(120,190,255,0.30)"
 WINDOW_RADIUS  = 26
-WINDOW_OUTLINE = QColor(255, 255, 255, 30)
+WINDOW_OUTLINE = QColor(100, 180, 255, 90)
 FONT_MONO = "Cascadia Code"
 FONT_SANS = "Segoe UI"
 def _glass_gradient_qss(radius: int = 18,
@@ -1037,13 +1037,14 @@ class SuggestionChip(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(
             "QPushButton {"
-            f"color:{TEXT_MUTED};"
-            f"background: rgba(255,255,255,0.06);"
-            f"border: 1px solid {GLASS_BORDER_SOFT};"
-            "border-radius: 15px; padding: 6px 14px;"
+            f"color:{TEXT_PRIMARY};"
+            "background: rgba(255,255,255,0.10);"
+            "border: 1px solid rgba(255,255,255,0.22);"
+            "border-radius: 16px; padding: 7px 16px;"
             f"font-family:'{FONT_SANS}'; font-size:11px;"
             "}"
-            "QPushButton:hover { background: rgba(255,255,255,0.11); }"
+            "QPushButton:hover { background: rgba(255,255,255,0.18);"
+            " border: 1px solid rgba(255,255,255,0.38); }"
         )
         self.clicked.connect(lambda: on_click(text))
         _add_glass_shadow(self, blur=14, dy=3, alpha=110)
@@ -1223,9 +1224,9 @@ class ChatTab(QWidget):
     def _build_sidebar(self) -> QWidget:
         panel = GlassFrame(self, radius=16, shadow=True, blur=24, dy=6,
                            shadow_alpha=120,
-                           top="rgba(255,255,255,0.06)",
-                           mid="rgba(255,255,255,0.035)",
-                           bot="rgba(255,255,255,0.02)",
+                           top="rgba(10,14,28,0.55)",
+                           mid="rgba(8,11,22,0.50)",
+                           bot="rgba(6,9,18,0.48)",
                            border=GLASS_BORDER_SOFT)
         panel.setFixedWidth(236)
         lay = QVBoxLayout(panel)
@@ -1900,6 +1901,9 @@ class ChatTab(QWidget):
         head.addStretch(1)
         col.addLayout(head)
         bubble = GlassFrame(row, radius=14, border=BUBBLE_BORDER,
+                            top="rgba(10,14,28,0.55)",
+                            mid="rgba(8,11,22,0.50)",
+                            bot="rgba(6,9,18,0.48)",
                             blur=22, dy=5, shadow_alpha=140)
         blay = QVBoxLayout(bubble)
         blay.setContentsMargins(16, 11, 16, 11)
@@ -4421,9 +4425,9 @@ class PeopleTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         frame = GlassFrame(self, radius=16, blur=24, dy=6, shadow_alpha=120,
-                           top="rgba(255,255,255,0.06)",
-                           mid="rgba(255,255,255,0.035)",
-                           bot="rgba(255,255,255,0.02)",
+                           top="rgba(10,14,28,0.55)",
+                           mid="rgba(8,11,22,0.50)",
+                           bot="rgba(6,9,18,0.48)",
                            border=GLASS_BORDER_SOFT)
         outer.addWidget(frame)
         lay = QVBoxLayout(frame)
@@ -6810,9 +6814,9 @@ class AudioTab(QWidget):
         grid.addWidget(self._panel(self._build_transcript_panel()), 0, 1, 2, 1)
     def _panel(self, inner: QWidget) -> QWidget:
         frame = GlassFrame(self, radius=16, blur=24, dy=6, shadow_alpha=120,
-                           top="rgba(255,255,255,0.06)",
-                           mid="rgba(255,255,255,0.035)",
-                           bot="rgba(255,255,255,0.02)",
+                           top="rgba(10,14,28,0.55)",
+                           mid="rgba(8,11,22,0.50)",
+                           bot="rgba(6,9,18,0.48)",
                            border=GLASS_BORDER_SOFT)
         lay = QVBoxLayout(frame)
         lay.setContentsMargins(14, 12, 14, 12)
@@ -7897,9 +7901,9 @@ class LocationTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         frame = GlassFrame(self, radius=16, blur=24, dy=6, shadow_alpha=120,
-                           top="rgba(255,255,255,0.06)",
-                           mid="rgba(255,255,255,0.035)",
-                           bot="rgba(255,255,255,0.02)",
+                           top="rgba(10,14,28,0.55)",
+                           mid="rgba(8,11,22,0.50)",
+                           bot="rgba(6,9,18,0.48)",
                            border=GLASS_BORDER_SOFT)
         outer.addWidget(frame)
         lay = QVBoxLayout(frame)
@@ -8051,9 +8055,9 @@ class PhotosTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         frame = GlassFrame(self, radius=16, blur=24, dy=6, shadow_alpha=120,
-                           top="rgba(255,255,255,0.06)",
-                           mid="rgba(255,255,255,0.035)",
-                           bot="rgba(255,255,255,0.02)",
+                           top="rgba(10,14,28,0.55)",
+                           mid="rgba(8,11,22,0.50)",
+                           bot="rgba(6,9,18,0.48)",
                            border=GLASS_BORDER_SOFT)
         outer.addWidget(frame)
         lay = QVBoxLayout(frame)
@@ -8285,9 +8289,9 @@ class AboutSystemTab(QWidget):
 
     def _panel_frame(self) -> "GlassFrame":
         return GlassFrame(self, radius=16, blur=24, dy=6, shadow_alpha=120,
-                          top="rgba(255,255,255,0.06)",
-                          mid="rgba(255,255,255,0.035)",
-                          bot="rgba(255,255,255,0.02)",
+                          top="rgba(10,14,28,0.55)",
+                          mid="rgba(8,11,22,0.50)",
+                          bot="rgba(6,9,18,0.48)",
                           border=GLASS_BORDER_SOFT)
 
     def _title(self, text: str) -> QLabel:
@@ -9016,6 +9020,80 @@ class TitleBar(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 # Main IRIS window — a single rounded, frameless "bubble" floating on the desktop
 # ─────────────────────────────────────────────────────────────────────────────
+def _enable_win11_backdrop(widget, kind: str = "acrylic") -> bool:
+    """Apply a native Windows frosted-glass backdrop behind a translucent Qt
+    window using the undocumented SetWindowCompositionAttribute accent API —
+    the same mechanism pywinstyles/win32mica use. Works on Windows 10 1803+
+    and Windows 11, and (on Win11) also rounds the corners + sets dark framing.
+    Returns True on success; a harmless no-op (False) elsewhere so the painted
+    shell is used instead."""
+    import sys as _sys
+    if not _sys.platform.startswith("win"):
+        return False
+    # 1) Prefer pywinstyles when it's installed — it handles the build-specific
+    #    quirks of Mica/Acrylic across Windows versions for us.
+    try:
+        import pywinstyles                                # type: ignore
+        for _target in (widget, int(widget.winId())):
+            try:
+                pywinstyles.apply_style(_target, kind)
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # 2) Fallback: native acrylic via SetWindowCompositionAttribute (no deps).
+    try:
+        import ctypes
+        from ctypes import (Structure, c_int, c_uint, POINTER, pointer,
+                            sizeof, byref)
+        hwnd = int(widget.winId())
+
+        class ACCENTPOLICY(Structure):
+            _fields_ = [("AccentState", c_int), ("AccentFlags", c_int),
+                        ("GradientColor", c_uint), ("AnimationId", c_int)]
+
+        class WINCOMPATTRDATA(Structure):
+            _fields_ = [("Attribute", c_int),
+                        ("Data", POINTER(ACCENTPOLICY)),
+                        ("SizeOfData", c_int)]
+
+        # 4 = ACCENT_ENABLE_ACRYLICBLURBEHIND, 3 = ACCENT_ENABLE_BLURBEHIND.
+        state = 4 if kind == "acrylic" else 3
+        accent = ACCENTPOLICY()
+        accent.AccentState = state
+        accent.AccentFlags = 0
+        # 0xAABBGGRR — a light dark tint so text stays readable over the blur.
+        accent.GradientColor = 0x40141210
+        accent.AnimationId = 0
+        data = WINCOMPATTRDATA()
+        data.Attribute = 19            # WCA_ACCENT_POLICY
+        data.Data = pointer(accent)
+        data.SizeOfData = sizeof(accent)
+        try:
+            set_wca = ctypes.windll.user32.SetWindowCompositionAttribute
+        except Exception:
+            set_wca = None
+        ok = bool(set_wca(hwnd, byref(data))) if set_wca else False
+
+        # Win11 niceties (best effort; ignored on older builds).
+        try:
+            dwm = ctypes.windll.dwmapi
+
+            def _dwm(attr, val):
+                v = c_int(val)
+                dwm.DwmSetWindowAttribute(hwnd, attr, byref(v), sizeof(v))
+            _dwm(20, 1)                # DWMWA_USE_IMMERSIVE_DARK_MODE
+            _dwm(33, 2)                # rounded corners
+            _dwm(38, 3)                # DWMWA_SYSTEMBACKDROP_TYPE = Acrylic
+        except Exception:
+            pass
+        return ok
+    except Exception as e:
+        print(f"[iris] backdrop unavailable: {e}")
+        return False
+
+
 class IrisApp(QWidget):
     TAB_NAMES = ["chat", "photos", "people", "audio", "location", "stream",
                  "about system"]   # M8: Chat, Photos, People prioritized
@@ -9139,18 +9217,36 @@ class IrisApp(QWidget):
         self._grip.setFixedSize(18, 18)
         self._grip.setStyleSheet("background: transparent;")
     # Paint the rounded gradient shell + a thin outline = the "bubble"
+    def showEvent(self, evt):
+        super().showEvent(evt)
+        # Turn on the native Windows 11 frosted backdrop once the window has a
+        # real HWND. Falls back silently to the painted shell everywhere else.
+        if not getattr(self, "_backdrop_applied", False):
+            self._backdrop_applied = True
+            self._backdrop_on = _enable_win11_backdrop(self, "acrylic")
+            if self._backdrop_on:
+                self.update()
+
     def paintEvent(self, _evt):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
         path.addRoundedRect(rect, WINDOW_RADIUS, WINDOW_RADIUS)
+        # Blue -> black liquid-glass gradient. Kept ~92% opaque so it always
+        # reads as the deep-blue glass look; if a native backdrop is active,
+        # the small remaining translucency lets a hint of blur show through.
+        # Deep, near-black frosted gradient (Apple-style dark glass).
+        # No bright top highlight band.
         g = QLinearGradient(0, 0, self.width(), self.height())
-        g.setColorAt(0.0, QColor(BG_TOP))
-        g.setColorAt(0.55, QColor(BG_MID))
-        g.setColorAt(1.0, QColor(BG_BOT))
+        g.setColorAt(0.0, QColor(6, 9, 18, 210))
+        g.setColorAt(0.5, QColor(8, 12, 24, 210))
+        g.setColorAt(1.0, QColor(11, 16, 32, 210))
         p.fillPath(path, QBrush(g))
-        pen = QPen(WINDOW_OUTLINE)
+        # very subtle cool tint for depth (uniform, not a top band)
+        p.fillPath(path, QColor(40, 80, 170, 12))
+        # soft hairline border
+        pen = QPen(QColor(120, 160, 230, 55))
         pen.setWidth(1)
         p.setPen(pen)
         p.drawPath(path)
