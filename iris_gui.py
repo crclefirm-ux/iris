@@ -2442,6 +2442,19 @@ class ChatTab(QWidget):
             self._append_iris(iq.describe_current_model(provider, model))
             return
         # --- IRIS meta-question: END ---
+        # --- IRIS chat-structure: ADD ---
+        # Structural chat-question early-exit. Handles ANY general
+        # question — coding, science, opinion, shopping, advice — before
+        # any specialized classifier can misfire on shared vocabulary.
+        # This is the single architectural gate that prevents queries
+        # like "reverse a linked list" or "explain quantum" from being
+        # hijacked by fuzzy classifiers.
+        if iq is not None and hasattr(iq, "is_general_chat_query") \
+                and iq.is_general_chat_query(text):
+            print(f"[route] chat-structure short-circuit: {text!r}")
+            self._start_bg(lambda: self._ask_ollama(text))
+            return
+        # --- IRIS chat-structure: END ---
         low = text.lower().strip()
         # (0) A reply that picks from a multi-match email topic search
         # ("check email containing handshake" -> 4 results -> user says
@@ -4520,6 +4533,122 @@ class ChatTab(QWidget):
         "Return ONLY the JSON. No markdown, no prose, no explanation."
     )
 
+    # --- IRIS router-guard: ADD ---
+    def _router_intent_guard(self, intent: str, text: str) -> bool:
+        """Cross-validate the LLM router's classification against regex
+        heuristics. Returns True only when the query has independent
+        evidence for the claimed intent. This is the single place where
+        every specialised intent's 'sanity check' lives — new intents
+        get added here, not in per-branch if-blocks."""
+        low = (text or "").lower().strip()
+        if not low:
+            return False
+
+        # Chat is always allowed to pass — it means "don't dispatch."
+        if intent == "chat":
+            return True
+
+        # Coding queries are ALWAYS chat, regardless of what the LLM says.
+        # Small models routinely misroute code questions to recording /
+        # memory / photo because of shared vocabulary (list, reverse, sort).
+        _CODING_HINTS = (
+            "python", "javascript", "typescript", " java ", "c++", "c#",
+            "html", "css", "sql", "regex", "html", "linked list",
+            "algorithm", "compile", "syntax error", "stack trace",
+            "recursion", "hashmap", "dictionary", "array", "reverse a",
+            "sort a", "def ", "class ", "import ", "return ", "print(",
+            "function that", "write a function", "help me code",
+            "help me debug", "fix this bug", "what does this error",
+            "in python", "in javascript", "in java", "in typescript",
+        )
+        if any(h in low for h in _CODING_HINTS):
+            return intent == "chat"  # only chat is valid for coding
+
+        # Meta questions about IRIS itself → not a specialised intent.
+        try:
+            if iq is not None and iq.is_meta_question(text):
+                return intent == "chat"
+        except Exception:
+            pass
+
+        if intent in ("date", "time"):
+            try:
+                return iq is not None and iq.is_date_question(text)
+            except Exception:
+                return False
+
+        if intent == "location":
+            try:
+                return self._is_location_question(low)
+            except Exception:
+                return False
+
+        if intent == "recording":
+            _NOUNS = ("recording", "recordings", "audio", "transcript",
+                      "transcripts", "conversation", "conversations",
+                      "clip", "clips", "recorded", "voice memo",
+                      "voice note", "voice notes", "session")
+            return any(n in low for n in _NOUNS)
+
+        if intent == "memory":
+            # Memory queries reference the user's past — past-tense verbs
+            # or explicit recall words. Coding hints are already rejected
+            # above, so if we got here it's a plausible memory query.
+            _CUES = ("did i", "what did", "when did", "who did",
+                     "where did", "remember", "remind", "recall",
+                     "we talked", "we discussed", "you mentioned",
+                     "i told you", "i said", "last time", "yesterday",
+                     "earlier", "before", "conversation about",
+                     "talked about")
+            return any(c in low for c in _CUES)
+
+        if intent == "email":
+            try:
+                ei = iq.classify_email(text) if iq is not None else None
+                if ei is not None and ei.kind != "none":
+                    return True
+                ai = iq.classify_action(text) if iq is not None else None
+                return (ai is not None
+                        and ai.kind == "action_open_email")
+            except Exception:
+                return False
+
+        if intent == "photo_take":
+            try:
+                ai = iq.classify_action(text) if iq is not None else None
+                if ai is not None and ai.kind == "action_start_video":
+                    return True
+            except Exception:
+                pass
+            _CUES = ("photo", "picture", "selfie", "screenshot",
+                     "snap", "snapshot")
+            _VERBS = ("take", "capture", "grab", "shoot")
+            return (any(c in low for c in _CUES)
+                    and any(v in low for v in _VERBS))
+
+        if intent == "photo_lookup":
+            _NOUNS = ("photo", "photos", "picture", "pictures", "pic",
+                      "pics", "screenshot", "screenshots", "snapshot")
+            return any(n in low for n in _NOUNS)
+
+        if intent == "video_take":
+            _CUES = ("record", "film", "shoot", "start recording",
+                     "capture video", "start the camera", "start camera")
+            return (any(c in low for c in _CUES) and "video" in low) \
+                   or "start recording" in low
+
+        if intent == "video_lookup":
+            try:
+                if hasattr(self, "_is_video_question"):
+                    return self._is_video_question(low)
+            except Exception:
+                pass
+            return ("video" in low or "clip" in low or "footage" in low)
+
+        # Unknown intent value from the LLM — reject.
+        return False
+    # --- IRIS router-guard: END ---
+    
     def _llm_route_intent(self, text: str):
         """Ollama-backed universal fallback for _dispatch_intent. Called
         when every hardcoded classifier returned kind='none'. Ask
@@ -4585,14 +4714,20 @@ class ChatTab(QWidget):
         # --- IRIS outlines: END ---
         intent = str(payload.get("intent", "")).lower().strip()
         print(f"[router] {text!r} -> {intent!r}")
+        # --- IRIS router-guard: ADD ---
+        # Centralised sanity check. Small models classify chat queries
+        # into random buckets ("reverse a linked list" -> recording,
+        # "what computer" -> location, etc). Each specialised intent has
+        # to independently pass a regex heuristic before we dispatch,
+        # otherwise fall through to chat. One function to maintain when
+        # new intents are added, no per-branch hardcoding.
+        if not self._router_intent_guard(intent, text):
+            print(f"[router] rejected {intent!r} — regex disagrees, "
+                  f"falling back to chat")
+            return None
+        # --- IRIS router-guard: END ---
 
         if intent in ("date", "time"):
-            # --- IRIS llm-router-guard: ADD ---
-            # Same guard rationale as location: re-validate against the
-            # regex-based date detector before running the date handler.
-            if iq is None or not iq.is_date_question(text):
-                return None
-            # --- IRIS llm-router-guard: END ---
             self._answer_date_question(text)
             return True
         if intent == "photo_take":
@@ -4622,16 +4757,6 @@ class ChatTab(QWidget):
             except Exception:
                 return None
         if intent == "location":
-            # --- IRIS llm-router-guard: ADD ---
-            # llama3.2:1b sometimes classifies shopping / advice / general
-            # questions ("what computer should I get") as location because
-            # of verbs like "get" or place-implying words. Re-validate
-            # against the regex trigger list — if the query has no real
-            # location cue, fall through to plain chat rather than
-            # hallucinating a WiFi-based answer.
-            if not self._is_location_question(text.lower().strip()):
-                return None
-            # --- IRIS llm-router-guard: END ---
             self._start_bg(lambda: self._answer_location_question(text))
             return True
         if intent == "photo_lookup":

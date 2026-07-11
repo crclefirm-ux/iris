@@ -2162,6 +2162,96 @@ def is_meta_question(text: str) -> bool:
         return True
     return False
 
+# --- IRIS chat-structure: ADD ---
+# Structural pattern for a general chat question. The two lists below
+# are fixed and small — they describe (a) English question grammar and
+# (b) YOUR app's feature set. Neither grows with new failure modes.
+# Anything matching pattern (a) but not pattern (b) is chat, full stop.
+# No downstream classifier — regex, LLM, or otherwise — gets a vote.
+
+_CHAT_STRUCTURE_STARTERS = (
+    # Explanation requests
+    "explain", "define", "describe", "clarify",
+    "what is a", "what is the", "what is an",
+    "what are", "what does", "what makes", "what causes",
+    "tell me about", "walk me through", "break down",
+    # How / why / when / where general questions
+    "how do i", "how do you", "how does", "how can i", "how can you",
+    "how would i", "how would you", "how are",
+    "why does", "why do", "why is", "why are", "why can",
+    "when should", "when do you", "when is it best",
+    "where should", "where can i", "where can you",
+    "which is", "which one", "which framework", "which library",
+    # Help / advice
+    "help me", "can you help", "please help", "i need help",
+    "recommend", "suggest", "advise", "any suggestions",
+    "should i", "should we", "would you", "would it be",
+    "is it a good idea", "is it worth",
+    "give me a", "give me some", "give me an", "list some",
+    # Compare / opinion
+    "compare", "difference between", "differences between",
+    "which is better", "what's better", "whats better",
+    "what's the best", "what is the best", "whats the best",
+    "opinion", "your take on", "your thoughts",
+    # Knowledge / definition
+    "who invented", "who created", "who wrote", "who founded",
+    "what year", "in what year",
+    # Imperative verbs to the AI — coding, math, generation, etc.
+    "write", "create", "generate", "make me", "build",
+    "implement", "design", "draft", "compose",
+    "reverse", "sort", "traverse", "iterate",
+    "compute", "calculate", "solve", "estimate",
+    "translate", "convert", "parse", "encode", "decode",
+    "optimize", "refactor", "debug", "test",
+    "review", "analyze", "summarize this",
+)
+
+_SPECIALIZED_NOUNS = (
+    # Recording domain
+    "recording", "recordings", "audio", "transcript", "transcripts",
+    "clip", "clips", "footage", "voice memo", "voice note",
+    "conversation", "conversations", "recorded",
+    # Photo domain
+    "photo", "photos", "picture", "pictures", "pic", "pics",
+    "screenshot", "screenshots", "selfie", "snapshot",
+    # Video domain
+    "video", "videos", "reel", "reels",
+    # Email domain
+    "email", "emails", "inbox", "gmail", "mail", "mailbox",
+    # Location / date / memory-specific phrasings
+    "where am i", "where are we", "current location", "my location",
+    "what day is", "what time is", "todays date", "today's date",
+    "did i say", "what did i", "when did i", "who did i",
+    "where did i", "how did i",
+    "we discussed", "we talked", "talked about",
+    "meeting with", "conversation with", "chat with",
+    "last time", "yesterday i", "today i",
+    # People domain
+    "who was", "who were", "who is in", "who's in",
+)
+
+
+def is_general_chat_query(text: str) -> bool:
+    """True when the query has clear chat-structure grammar AND doesn't
+    mention any specialized noun the app handles. Runs at the very top
+    of _route_command as an early exit — no downstream classifier gets
+    to see a query that matches this rule.
+
+    Architecture: this defines what chat LOOKS LIKE structurally,
+    instead of enumerating every failure mode. The two constant lists
+    above are bounded — one describes English grammar, the other
+    describes the app's feature set. Neither grows with new bugs."""
+    if not text:
+        return False
+    low = text.lower().strip().rstrip("?!.")
+    if not low:
+        return False
+    # Must start with a chat-structure starter.
+    if not any(low.startswith(s) for s in _CHAT_STRUCTURE_STARTERS):
+        return False
+    # Must NOT reference a specialized noun.
+    return not any(n in low for n in _SPECIALIZED_NOUNS)
+# --- IRIS chat-structure: END ---
 
 def describe_current_model(provider: str = "", model: str = "") -> str:
     """Human-friendly one-liner describing which LLM is answering. Reads
