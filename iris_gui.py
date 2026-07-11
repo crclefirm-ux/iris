@@ -8257,6 +8257,40 @@ class AudioTab(QWidget):
             return
         QTimer.singleShot(self._WAKE_POLL_MS,
                           lambda: self._wake_cycle_poll(snippet, 0))
+    @staticmethod
+    def _is_wake_command(text: str) -> bool:
+        """True if a live-transcription chunk looks like something IRIS
+        should act on, not just background chatter to log and ignore.
+
+        This used to be `iq.is_photo_trigger(text)` alone, which meant the
+        live wake-word listener could only ever fire for photo requests —
+        "hey jarvis, open up gmail" got transcribed and shown in the
+        rolling transcript (see _append_live_text above) but the wake
+        callback was never invoked, so nothing happened. handle_voice_trigger
+        (the wake callback) already routes through the same _route_command
+        classifier chain typed chat text uses, so it's able to handle
+        email/video/audio actions too — it just needed to actually be
+        called for those phrases. Checked in the same order _route_command
+        would naturally reach them: photo first (its own domain), then
+        UI-action intents (open email / start video / start audio), then
+        a content-read email command ('check my email', 'email about X').
+        """
+        if iq is None or not text:
+            return False
+        if iq.is_photo_trigger(text):
+            return True
+        try:
+            if iq.classify_action(text).kind != "none":
+                return True
+        except Exception:
+            pass
+        try:
+            if iq.classify_email(text).kind != "none":
+                return True
+        except Exception:
+            pass
+        return False
+
     def _wake_cycle_poll(self, snippet: str, attempts: int) -> None:
         if not self._wake_active:
             self._cleanup_wake_snippet(snippet)
@@ -8286,7 +8320,7 @@ class AudioTab(QWidget):
         # Show chunk in rolling transcript
         if text:
             self._append_live_text(text)
-        if text and iq is not None and iq.is_photo_trigger(text):
+        if text and iq is not None and self._is_wake_command(text):
             heard = text.strip()
             short = heard if len(heard) <= 50 else heard[:47] + "\u2026"
             self.dot_wake.set(
