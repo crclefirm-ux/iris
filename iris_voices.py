@@ -55,6 +55,21 @@ LOW_CONFIDENCE_MIN  = MATCH_THRESHOLD   # 0.60
 LOW_CONFIDENCE_MAX  = CONFIRM_BELOW     # 0.70
 
 
+# --- IRIS voice-noise-gate: ADD ---
+# Minimum cluster size required before we're willing to enroll a brand-new
+# Unknown-N row. Every recording used to spawn a new Unknown for any tiny
+# cluster the diarizer produced — echoes, background chatter, single-word
+# blips — which is where the 63-voice pile-up in the People tab came from.
+# A cluster with fewer than this many segments is either noise or a
+# transient speaker who won't come back; either way, enrolling it just
+# adds a placeholder row that has to be manually cleaned up later.
+#
+# Existing rows are still matched against normally — this gate only
+# suppresses NEW enrollments, not lookups against known voices.
+MIN_SEGMENTS_FOR_ENROLLMENT = 3
+# --- IRIS voice-noise-gate: END ---
+
+
 # ── dataclasses ──────────────────────────────────────────────────────────
 @dataclass
 class ProcessedVoice:
@@ -95,6 +110,15 @@ class VoicePipeline:
     def __init__(self):
         self._lock = threading.RLock()
         self._unknown_counter_lock = threading.Lock()
+        # --- IRIS voice-noise-gate: ADD ---
+        # Bump every N processed recordings we ask the store to fold any
+        # near-duplicate Unknowns together. Cheap on small registries; a
+        # no-op if there's nothing to merge. Counter is per-process, so
+        # a fresh launch always runs it once via PeopleStore's own
+        # startup consolidate (see iris_people.PeopleStore.__init__).
+        self._consolidate_every = 5
+        self._processed_since_consolidate = 0
+        # --- IRIS voice-noise-gate: END ---
 
     # ── headline: process one recording ──────────────────────────────────
     def process_recording(self, wav_path: str,
@@ -177,6 +201,21 @@ class VoicePipeline:
                 result.mentioned_names = []
 
             self._write_marker(wav_path, result)
+
+            # --- IRIS voice-noise-gate: ADD ---
+            # Periodic housekeeping: if this batch enrolled anything new,
+            # nudge the store to fold near-duplicate Unknowns. Cheap in
+            # the common case (nothing to merge), meaningful over time.
+            self._processed_since_consolidate += 1
+            if (result.clusters_enrolled > 0
+                    or self._processed_since_consolidate
+                    >= self._consolidate_every):
+                self._processed_since_consolidate = 0
+                try:
+                    store.consolidate_unknowns()
+                except Exception as e:
+                    print(f"[voices] consolidate_unknowns failed: {e}")
+            # --- IRIS voice-noise-gate: END ---
 
         print(f"[voices] {os.path.basename(wav_path)}: "
               f"{result.clusters_total} cluster"
@@ -381,6 +420,16 @@ class VoicePipeline:
             if store.get_by_name(new_name) is not None:
                 new_name = self._disambiguate_name(new_name, store)
         else:
+            # --- IRIS voice-noise-gate: ADD ---
+            # Suppress brand-new Unknown-N enrollment when the cluster is
+            # too small to be a real speaker. This is the main source of
+            # the People-tab pile-up: every noise blip, single-word
+            # background chatter, or clipped intro would spawn its own
+            # Unknown row. Existing rows are still matched (that's above);
+            # this only blocks the "create yet another Unknown" path.
+            if n_segments < MIN_SEGMENTS_FOR_ENROLLMENT:
+                return None
+            # --- IRIS voice-noise-gate: END ---
             new_name = self._next_unknown_name(store)
 
         person = store.add(new_name, voice_embedding=v)

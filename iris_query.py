@@ -1656,7 +1656,56 @@ _ACTION_EMAIL_CUES = (
     "open email", "open up email", "open my email", "open the email",
     "check email", "check my email", "open gmail", "check gmail",
     "open my inbox", "open inbox", "pull up my email", "pull up email",
+    # --- IRIS email-wake-word: ADD ---
+    # Voice-first phrasings that arrive through the wake-word transcript
+    # ("hey jarvis, open up my email"). _strip_wake_prefix() removes the
+    # wake prefix before this list is checked, so we only need to cover
+    # the tail of the utterance here.
+    "open up my email", "open up my emails",
+    "open up my inbox", "open up gmail", "open up my gmail",
+    "bring up email", "bring up my email", "bring up gmail",
+    "bring up my inbox", "bring up my mail",
+    "show me my email", "show me my emails", "show me my inbox",
+    "show my email", "show my emails", "show my inbox",
+    "launch gmail", "launch email", "launch my email",
+    "go to gmail", "go to my email", "go to my inbox",
+    "load my email", "load gmail", "load my inbox",
+    "email tab", "gmail tab", "inbox tab",
+    # --- IRIS email-wake-word: END ---
 )
+
+
+# --- IRIS wake-word: ADD ---
+# Strip the "hey jarvis" family of wake prefixes off the front of a
+# transcribed utterance BEFORE any classifier runs on it. Without this,
+# phrases like "hey jarvis open up my email" don't match the email cue
+# list because the cues expect the utterance to start with the verb.
+# Also handles "iris" / "hey iris" / trailing punctuation.
+#
+# Order matters — longer / more specific prefixes first so "hey jarvis"
+# wins over a bare "jarvis" that would otherwise chomp the leading j.
+_WAKE_PREFIXES = (
+    "hey jarvis", "hi jarvis", "okay jarvis", "ok jarvis",
+    "yo jarvis", "hello jarvis",
+    "hey iris", "hi iris", "okay iris", "ok iris", "hello iris",
+    "jarvis", "iris",
+)
+
+def _strip_wake_prefix(low: str) -> str:
+    """Return `low` with any leading wake-word prefix removed. Idempotent
+    — running it twice is the same as running it once. Case-insensitive
+    only when caller has already lower-cased the string, which every
+    caller in this module does."""
+    s = (low or "").lstrip()
+    for pref in _WAKE_PREFIXES:
+        if s.startswith(pref):
+            tail = s[len(pref):]
+            # Eat any comma / whitespace that separated the prefix from
+            # the command, then return the rest of the utterance.
+            tail = tail.lstrip(" ,.:;-!?\t")
+            return tail
+    return s
+# --- IRIS wake-word: END ---
 
 
 def classify_action(text: str) -> ActionIntent:
@@ -1672,6 +1721,11 @@ def classify_action(text: str) -> ActionIntent:
     corrected = correct_text(normed) if normed else correct_text(text or "")
     # --- IRIS typo-tolerance: END ---
     low = corrected.lower().strip()
+    # --- IRIS wake-word: ADD ---
+    # "hey jarvis, open up my email" -> "open up my email" so the phrase
+    # lists below can match without needing to include every wake variant.
+    low = _strip_wake_prefix(low)
+    # --- IRIS wake-word: END ---
     intent = ActionIntent(corrected_text=corrected)
     if not low:
         return intent
@@ -1757,6 +1811,32 @@ _EMAIL_READ_CUES = (
     "any new email", "any new emails",
     "do i have email", "do i have any email", "do i have new email",
     "pull up my email", "pull up email",
+    # --- IRIS email-wake-word: ADD ---
+    # Voice-first phrasings for the "hey jarvis, did I get an email
+    # from Josh yesterday" flow. These are checked *after* the wake-word
+    # prefix has been stripped, so no "hey jarvis" variants here.
+    "check my inbox", "check the inbox", "check inbox",
+    "read my inbox", "read the inbox",
+    "any emails", "any email", "got any email", "got any emails",
+    "got new email", "got new emails",
+    "did i get an email", "did i get any email", "did i get any emails",
+    "did i get emails", "did i get emails today", "did i get an email today",
+    "did i get any email today", "did i get any emails today",
+    "did i get an email yesterday", "did i get any email yesterday",
+    "did i get any emails yesterday",
+    "was there an email", "was there any email",
+    "is there an email", "is there any email", "is there any emails",
+    "show me my email", "show me my emails", "show me my inbox",
+    "show my email", "show my emails", "show my inbox",
+    "give me the latest email", "give me my latest email",
+    "give me the newest email", "give me my newest email",
+    "give me my email", "give me my emails",
+    "get me my email", "get me my emails", "get me the latest email",
+    "fetch my email", "fetch my emails", "fetch the latest email",
+    "find my email", "find my emails", "find me an email",
+    "search my email", "search my emails", "search my inbox",
+    "any mail", "any new mail", "got mail",
+    # --- IRIS email-wake-word: END ---
 )
 
 _EMAIL_ORDINAL_WORDS = {
@@ -1881,7 +1961,16 @@ _EMAIL_SENDER_CUES = (
 _SENDER_TRAILING_FILLER_RE = re.compile(
     r"\s+(in it|in the email|in my (?:inbox|email)|"
     r"listed out|listed|out loud|out|shown|displayed|"
-    r"please|for me|right now|now|thanks|thank you)\s*$",
+    r"please|for me|right now|now|thanks|thank you|"
+    # --- IRIS email-wake-word: ADD ---
+    # Date-word filler tails ("from josh yesterday", "from ali last week"
+    # etc.) — used to leak into the captured sender name.
+    r"yesterday|today|tonight|earlier|recently|"
+    r"this (?:morning|afternoon|evening|week|weekend|month)|"
+    r"last (?:night|week|weekend|month|year)|"
+    r"a (?:while|bit) ago|ago"
+    # --- IRIS email-wake-word: END ---
+    r")\s*$",
     re.I,
 )
 
@@ -1990,6 +2079,115 @@ _RECORDING_HARDBLOCK = (
 )
 
 
+# --- IRIS meta-question: ADD ---
+# Detects questions about IRIS itself — the underlying LLM, the app
+# version, what IRIS "is" — that should never be routed to the date /
+# location / recording classifiers. Without this guard, phrases like
+# "what model are you running on right now" get caught by the location
+# classifier ("right now" -> current location) and "what model are you"
+# gets caught by the date classifier ('what … you' + fuzzy keyword drift).
+#
+# All three of _MODEL_META_RE / _ASSISTANT_META_RE / _VERSION_META_RE
+# are intentionally narrow: they require an EXPLICIT reference to the AI
+# ("model", "llm", "ai", "assistant", "you") so ordinary chat like
+# "what model of laptop should I buy" isn't hijacked.
+_MODEL_META_RE = re.compile(
+    r"\b(?:what|which|tell\s+me)\b[^?]{0,40}\b"
+    r"(?:model|llm|language\s+model|ai|assistant)\b"
+    r"[^?]{0,40}\b(?:you|running|used|use|is\s+this|are\s+we)\b",
+    re.I,
+)
+_ASSISTANT_META_RE = re.compile(
+    r"\b(?:what|which|who)\s+(?:kind\s+of\s+|type\s+of\s+)?"
+    r"(?:ai|llm|assistant|bot|model)\s+(?:are\s+you|is\s+this)\b",
+    re.I,
+)
+_VERSION_META_RE = re.compile(
+    r"\bwhat\s+(?:version|build|release)\s+(?:are\s+you|is\s+this|of\s+iris)\b",
+    re.I,
+)
+# Short exact-phrase whitelist for the most common bare forms, checked
+# after the regexes so obvious cases can't slip past a stray character.
+_META_EXACT_PHRASES = (
+    "what model are you",
+    "what model are you running",
+    "what model are you running on",
+    "what model are you running on right now",
+    "what model is this",
+    "what llm are you",
+    "what llm is this",
+    "what ai are you",
+    "what ai is this",
+    "which model are you",
+    "which model is this",
+    "which llm are you",
+    "which ai are you",
+    "what version are you",
+    "what version is this",
+    "who are you",
+    "what are you",
+    "what are you running on",
+    "who made you",
+    "who built you",
+    "who created you",
+    "what's your model",
+    "whats your model",
+    "what is your model",
+    "your model",
+    "current model",
+    "current llm",
+)
+
+def is_meta_question(text: str) -> bool:
+    """True when the user is asking about the AI itself (the model
+    powering IRIS, its version, who made it) rather than about the world.
+    Callers should short-circuit before the date / location / recording
+    classifiers see the message."""
+    if not text:
+        return False
+    try:
+        corrected = correct_text(normalize_casual(text))
+    except Exception:
+        corrected = text
+    low = corrected.lower().strip().rstrip("?!. ")
+    if not low:
+        return False
+    if low in _META_EXACT_PHRASES:
+        return True
+    if _MODEL_META_RE.search(low):
+        return True
+    if _ASSISTANT_META_RE.search(low):
+        return True
+    if _VERSION_META_RE.search(low):
+        return True
+    return False
+
+
+def describe_current_model(provider: str = "", model: str = "") -> str:
+    """Human-friendly one-liner describing which LLM is answering. Reads
+    the pill values the About-System tab already tracks, so the answer
+    stays honest even after a provider swap. `provider` and `model` are
+    the same strings iris_gui.py's _resolve_current_model() returns."""
+    provider = (provider or "").strip().lower()
+    model = (model or "").strip()
+    provider_labels = {
+        "openai":    "OpenAI",
+        "anthropic": "Anthropic",
+        "google":    "Google Gemini",
+        "gemini":    "Google Gemini",
+        "azure":     "Azure OpenAI",
+        "ollama":    "local Ollama",
+        "":          "local Ollama",
+    }
+    label = provider_labels.get(provider, provider.title() or "local Ollama")
+    if model:
+        return (f"I'm answering as IRIS, running on **{model}** via "
+                f"{label}. You can switch providers in the About System tab.")
+    return (f"I'm answering as IRIS, running via {label}. "
+            f"You can switch providers in the About System tab.")
+# --- IRIS meta-question: END ---
+
+
 def is_date_question(text: str) -> bool:
     """True for questions asking IRIS what the date/time is right now.
 
@@ -2005,6 +2203,13 @@ def is_date_question(text: str) -> bool:
     """
     if not text:
         return False
+    # --- IRIS meta-question: ADD ---
+    # Meta-questions about IRIS itself must never route to the date
+    # classifier. Without this guard, "what model are you" fell through
+    # to the fuzzy keyword scan below and got answered with today's date.
+    if is_meta_question(text):
+        return False
+    # --- IRIS meta-question: END ---
     corrected = correct_text(normalize_casual(text))
     low = corrected.lower().strip().rstrip("?!. ")
     if not low:
@@ -2034,6 +2239,81 @@ def is_date_question(text: str) -> bool:
 # --- IRIS email-sender: END ---
 
 
+# --- IRIS email-wake-word: ADD ---
+# Verb-form email references: "josh emailed me yesterday", "i think ali
+# sent me an email", "did prani email me last week". We match these so
+# voice commands that never say the noun "email" still get routed to the
+# email lookup path. Restricted to first-/third-person object pronouns
+# ("me" / "us") so we don't drag ordinary conversation like "ali emailed
+# work about the invoice" into email search — that's a statement about
+# ali's actions, not a request from the user.
+_EMAILED_ME_VERB_RE = re.compile(
+    r"\b(?:"
+    r"emailed|e-?mailed|"
+    r"(?:did\s+\w+\s+)?email\s+(?:me|us)|"     # "did josh email me"
+    r"email\s+(?:me|us)\s+(?:today|yesterday|"  # "email me yesterday"
+    r"this\s+\w+|last\s+\w+|earlier|recently|"
+    r"about|regarding)|"
+    r"sent\s+(?:me|us)\s+(?:an?\s+)?e-?mail(?:s)?|"
+    r"shot\s+(?:me|us)\s+(?:an?\s+)?e-?mail(?:s)?"
+    r")\b(?:\s+(?:me|us))?",
+    re.I,
+)
+
+# Sender extraction anchored to the "emailed me" verb form. Handles
+# "josh emailed me", "i think josh emailed me yesterday", "did josh
+# email me today", "prani sent me an email last night". Returns the
+# captured name, or "" if nothing matched.
+_EMAILED_ME_SENDER_PATTERNS = (
+    # Filler-tolerant leading form: "(i think/i believe/maybe) X emailed me"
+    re.compile(
+        r"(?:^|\b)(?:i\s+think\s+|i\s+believe\s+|maybe\s+|"
+        r"i\s+guess\s+|possibly\s+)?"
+        r"(?:did\s+)?"
+        r"([A-Z][A-Za-z'\-\.]+(?:\s+[A-Z][A-Za-z'\-\.]+)?)"
+        r"\s+(?:emailed|e-?mailed)\s+(?:me|us)\b",
+        re.I,
+    ),
+    # "X sent me an email" / "X sent me some emails"
+    re.compile(
+        r"(?:^|\b)(?:i\s+think\s+|i\s+believe\s+|maybe\s+|"
+        r"i\s+guess\s+|possibly\s+)?"
+        r"(?:did\s+)?"
+        r"([A-Z][A-Za-z'\-\.]+(?:\s+[A-Z][A-Za-z'\-\.]+)?)"
+        r"\s+(?:sent|shot)\s+(?:me|us)\s+(?:an?\s+|some\s+)?e-?mail(?:s)?\b",
+        re.I,
+    ),
+    # "did X email me" — bare-infinitive form
+    re.compile(
+        r"\bdid\s+"
+        r"([A-Z][A-Za-z'\-\.]+(?:\s+[A-Z][A-Za-z'\-\.]+)?)"
+        r"\s+e-?mail\s+(?:me|us)\b",
+        re.I,
+    ),
+)
+
+def _extract_emailed_me_sender(text: str) -> str:
+    """Return the sender named in a 'X emailed me' style utterance, or "".
+    Kept case-preserving so downstream Gmail search sees 'Josh' not
+    'josh'. Strips trailing filler ("yesterday", "last week", "please")."""
+    if not text:
+        return ""
+    for pat in _EMAILED_ME_SENDER_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
+        name = (m.group(1) or "").strip()
+        # Guard: obvious pronouns / articles that regex-camelcased through.
+        low = name.lower()
+        if low in {"the", "a", "an", "i", "we", "you", "they", "he", "she",
+                   "it", "this", "that", "someone", "somebody", "did", "do"}:
+            continue
+        if 1 <= len(name) <= 60:
+            return name
+    return ""
+# --- IRIS email-wake-word: END ---
+
+
 def classify_email(text: str) -> EmailIntent:
     """Decide whether the message wants an email's content read out in
     chat. Fires on either an explicit read/check cue OR clear topic
@@ -2045,6 +2325,17 @@ def classify_email(text: str) -> EmailIntent:
     corrected = correct_text(normed) if normed else correct_text(text or "")
     # --- IRIS typo-tolerance: END ---
     low = corrected.lower().strip()
+    # --- IRIS wake-word: ADD ---
+    # "hey jarvis, did i get an email from josh yesterday" ->
+    # "did i get an email from josh yesterday" before cue matching. Also
+    # remove the wake prefix from `corrected` so topic / sender extraction
+    # doesn't see "jarvis" as a proper-noun candidate.
+    low = _strip_wake_prefix(low)
+    if corrected.lower().strip() != low:
+        # Rewrite `corrected` to reflect the stripped prefix so the
+        # sender / topic extractors below operate on the actual command.
+        corrected = corrected[len(corrected) - len(low):] if len(corrected) >= len(low) else low
+    # --- IRIS wake-word: END ---
     intent = EmailIntent(corrected_text=corrected)
     if not low:
         return intent
@@ -2053,7 +2344,26 @@ def classify_email(text: str) -> EmailIntent:
     # --- IRIS email-sender: ADD ---
     sender = _extract_email_sender(corrected)
     # --- IRIS email-sender: END ---
+    # --- IRIS email-wake-word: ADD ---
+    # "i think josh emailed me yesterday", "did josh email me today",
+    # "josh emailed me last week" — verb-form phrasings that don't say
+    # the noun "email" explicitly but clearly reference an email event.
+    # We treat these as email-search commands with the person as sender.
+    # Only fires when there's no cue/topic/sender picked up above so the
+    # richer extractors keep priority.
+    if not (topic or sender):
+        wake_sender = _extract_emailed_me_sender(corrected)
+        if wake_sender:
+            sender = wake_sender
+    # --- IRIS email-wake-word: END ---
     has_cue = _has_email_read_cue(low)
+    # --- IRIS email-wake-word: ADD ---
+    # Treat a bare "emailed me" / "sent me an email" phrase (with or
+    # without a named sender) as a read cue so the classifier fires even
+    # when the user never says the word "email" as a noun.
+    if not has_cue and _EMAILED_ME_VERB_RE.search(low):
+        has_cue = True
+    # --- IRIS email-wake-word: END ---
     if not (topic or sender or has_cue):
         return intent
 

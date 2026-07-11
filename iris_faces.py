@@ -97,6 +97,17 @@ MIN_FACE_SIZE_PX = 60
 MIN_FACE_CONFIDENCE = 0.0
 
 
+# --- IRIS face-self-merge: ADD ---
+# Softer match threshold used *only* when there's already an is_self row
+# in the registry: if a face doesn't clear the strict 0.60 bar but sits
+# in the 0.50-0.60 band against the self row, we merge into self instead
+# of creating yet another Unknown-N. That's what stops "Unknown 1" from
+# accumulating 10 face embeddings alongside the real self row (which
+# only has 5, exactly like the People-tab screenshot).
+SELF_SOFT_MATCH = 0.50
+# --- IRIS face-self-merge: END ---
+
+
 # ── dataclasses ──────────────────────────────────────────────────────────
 @dataclass
 class FaceCrop:
@@ -145,6 +156,14 @@ class FacePipeline:
         # Hold references so the GC can't dump the loaded module objects.
         self._df  = None    # the deepface module
         self._cv2 = None    # cv2 module
+        # --- IRIS face-self-merge: ADD ---
+        # How many process_frame() calls between periodic consolidation
+        # pass. Frames typically arrive at ~1 Hz in Stream tab; running
+        # the merge every 30 frames costs almost nothing and steadily
+        # keeps the Unknown-* pile-up under control between restarts.
+        self._consolidate_every = 30
+        self._frames_since_consolidate = 0
+        # --- IRIS face-self-merge: END ---
 
     # ── loading ──────────────────────────────────────────────────────────
     def warm_up(self, blocking: bool = False, timeout: float = 60.0) -> bool:
@@ -341,6 +360,34 @@ class FacePipeline:
                     detect_confidence=crop.confidence,
                 ))
             else:
+                # --- IRIS face-self-merge: ADD ---
+                # No strict match. Before spawning yet another Unknown,
+                # check the softer self-match band: if there's an is_self
+                # row already AND this face lands in the 0.50-0.60 band
+                # against it, treat it as the user (reinforce the self
+                # row) instead of enrolling a new placeholder. This is
+                # what stops the "Unknown 1 has 10 faces alongside the
+                # 5-face Humza row" state seen in the People tab.
+                self_row = store.get_self()
+                if self_row is not None:
+                    soft = store.match_face(emb,
+                                             threshold=SELF_SOFT_MATCH)
+                    if soft is not None and soft.person.id == self_row.id:
+                        store.mark_seen(self_row.id)
+                        store.add_embedding(self_row.id,
+                                             iris_people.KIND_FACE, emb)
+                        out.append(ProcessedFace(
+                            person_id=self_row.id,
+                            name=self_row.name,
+                            similarity=soft.similarity,
+                            bbox=(crop.x, crop.y, crop.w, crop.h),
+                            was_new_enrollment=False,
+                            was_reinforced=True,
+                            detect_confidence=crop.confidence,
+                        ))
+                        continue
+                # --- IRIS face-self-merge: END ---
+
                 # Unknown face → enroll on first sight (Pranav's call).
                 name = self._next_unknown_name(store)
                 person = store.add(name, face_embedding=emb)
@@ -356,6 +403,20 @@ class FacePipeline:
                     was_reinforced=False,
                     detect_confidence=crop.confidence,
                 ))
+        # --- IRIS face-self-merge: ADD ---
+        # Periodic housekeeping so the pile-up doesn't build up between
+        # explicit restarts. ensure_self also runs here — if the user
+        # never marked a self row, the first Unknown to cross the
+        # face-count / times_seen bars gets promoted.
+        self._frames_since_consolidate += 1
+        if self._frames_since_consolidate >= self._consolidate_every:
+            self._frames_since_consolidate = 0
+            try:
+                store.ensure_self_from_dominant_unknown()
+                store.consolidate_unknowns()
+            except Exception as e:
+                print(f"[faces] periodic consolidate failed: {e}")
+        # --- IRIS face-self-merge: END ---
         return out
 
     # ── helpers ──────────────────────────────────────────────────────────

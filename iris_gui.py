@@ -1323,25 +1323,47 @@ class ChatTab(QWidget):
         self._active: Optional[Recording] = None
         self._pending_pick: Optional[list[Recording]] = None
         self._polling: set[str] = set()
+        # --- IRIS chat-prompt: CHANGE ---
+        # Previous prompt refused ALL queries without transcript/clip data.
+        # That blocked general chat ("what computer should i get" got "I
+        # can't provide recommendations"). New prompt keeps strict-adherence
+        # for recording/clip Q&A but lets general questions be answered
+        # normally, the way any AI assistant would.
         self._system_prompt = (
-            "You are IRIS, a local assistant. You can read the user's audio "
-            "recordings, including their transcripts and summaries. When a "
-            "recording's transcript is provided to you below, answer strictly "
-            "from it and never invent details. If something isn't in the "
-            "transcript, say so. Be concise, and when summarizing a recording, "
-            "offer 2-3 specific follow-up questions the user could ask about it. "
-            "You can ALSO access the ESP32 camera's saved video clips: when a "
-            "list of saved video clips is provided below, it includes each "
-            "clip's recording time, length, and how many people were detected "
-            "in it (with recognised names when available). Use that data to "
-            "answer questions about the videos, such as how many people were in "
-            "a clip or who was seen. Answer strictly from the clip data given; "
-            "if a detail isn't there, say so. "
-            "If neither a transcript nor any video-clip data is included in the "
-            "message you are answering, you do NOT have access to that "
-            "recording's or clip's contents: do not guess or invent what it "
-            "says, and say it isn't available."
+            "You are IRIS, a helpful personal AI assistant. You operate in "
+            "three modes depending on the message you receive:\n"
+            "\n"
+            "1. GENERAL CHAT — When the user asks about the outside world "
+            "(opinions, recommendations, shopping, coding help, general "
+            "knowledge, weather, advice, small talk, meta questions about "
+            "yourself, or anything not tied to their recordings, photos, or "
+            "video clips), answer helpfully and conversationally, the same "
+            "way a normal AI assistant would. Do NOT refuse general "
+            "questions. Do NOT say 'I can only answer questions about "
+            "recordings.' Just answer.\n"
+            "\n"
+            "2. RECORDING Q&A — When a transcript, summary, or recording "
+            "content is included below the user's question, answer STRICTLY "
+            "from that content and never invent details. If the transcript "
+            "does not contain the answer, say so. When summarizing a "
+            "recording, offer 2-3 specific follow-up questions the user "
+            "could ask about it.\n"
+            "\n"
+            "3. VIDEO CLIP Q&A — When a list of saved video clips is "
+            "included below the user's question (with each clip's recording "
+            "time, length, detected people, and recognised names), answer "
+            "STRICTLY from that data. Never invent what happened in a clip. "
+            "If a specific detail isn't in the clip data, say so.\n"
+            "\n"
+            "Key rule: only refuse or say 'that isn't available' when the "
+            "user is asking about a SPECIFIC recording, clip, photo, or "
+            "past event AND the relevant data isn't included below. General "
+            "questions about the world always get a real answer.\n"
+            "\n"
+            "Be concise. Prefer natural sentences over bullet points unless "
+            "the user asks for a list."
         )
+        # --- IRIS chat-prompt: END ---
         # Session history (sidebar). Degrades gracefully if the module is gone.
         self._sessions = isess.SessionStore() if isess is not None else None
         self._session = (self._sessions.new_session()
@@ -2216,6 +2238,12 @@ class ChatTab(QWidget):
         UI-facing callers (_on_submit for typed text, handle_voice_trigger
         for spoken commands) only differ in how they echo the input into
         the chat log before handing off here."""
+        # --- IRIS meta-question: ADD ---
+        if iq is not None and iq.is_meta_question(text):
+            provider, model = self._resolve_current_model()
+            self._append_iris(iq.describe_current_model(provider, model))
+            return
+        # --- IRIS meta-question: END ---
         low = text.lower().strip()
         # (0) A reply that picks from a multi-match email topic search
         # ("check email containing handshake" -> 4 results -> user says
@@ -4246,26 +4274,51 @@ class ChatTab(QWidget):
     # --- IRIS outlines: END ---
 
     # --- IRIS llm-router: ADD ---
-    _INTENT_ROUTER_MODEL = "llama3.2:1b"
+    _INTENT_ROUTER_MODEL = "llama3.2:3b"
     _INTENT_ROUTER_PROMPT = (
-        "You are IRIS's intent router. Given the user's chat message, "
-        "reply with ONE JSON object and nothing else:\n"
-        "{\"intent\":\"date|time|photo_take|photo_lookup|video_take|"
-        "video_lookup|email|recording|memory|location|chat\",\"detail\":\"\"}\n"
-        "Definitions:\n"
-        " - date/time  = user is asking what day/date/time it is right now\n"
-        " - photo_take = user is asking IRIS to take a picture/selfie/"
-        "screenshot right now\n"
-        " - photo_lookup = user is asking about EXISTING photos already saved\n"
-        " - video_take = user is asking IRIS to record/start a video right now\n"
-        " - video_lookup = user is asking about existing recorded video clips\n"
-        " - email      = user is asking about their email (read/find/summarize)\n"
-        " - recording  = user is asking about saved audio recordings or "
-        "transcripts\n"
-        " - memory     = user is asking about past conversations, people, "
-        "places, or things they said\n"
-        " - location   = user is asking where they are right now\n"
-        " - chat       = normal conversation, none of the above apply\n"
+        "You are IRIS's intent router. Your job: identify the ONE case where "
+        "the user's message CLEARLY matches a specialized handler. If you "
+        "are unsure — or the message is a general question, opinion, "
+        "recommendation, shopping, chit-chat, coding help, or anything "
+        "about the outside world — the answer is 'chat'.\n"
+        "\n"
+        "Reply with ONE JSON object and nothing else:\n"
+        "{\"intent\":\"chat|date|time|photo_take|photo_lookup|video_take|"
+        "video_lookup|email|recording|memory|location\",\"detail\":\"\"}\n"
+        "\n"
+        "DEFAULT: chat. Most messages are chat. Only pick a specialized "
+        "intent if the message EXPLICITLY asks for it.\n"
+        "\n"
+        "Specialized intents fire only on strong cues:\n"
+        " - date/time: 'what day is it', 'what time is it', 'what's the "
+        "date today'. NOT triggered by passing mention of a date.\n"
+        " - photo_take: 'take a photo', 'take a picture', 'take a selfie'. "
+        "Direct command only.\n"
+        " - photo_lookup: 'show my photos', 'find the picture from...'.\n"
+        " - video_take: 'record a video', 'start recording'. Direct.\n"
+        " - video_lookup: 'who was in the video', 'what happened in the "
+        "recording'.\n"
+        " - email: 'check my email', 'did X email me', must mention "
+        "email/inbox/gmail OR use 'emailed me' verb.\n"
+        " - recording: 'what was in my last recording', 'summarize the "
+        "conversation from...'.\n"
+        " - memory: 'what did I say about X', 'who is Y' when Y is a "
+        "specific person/topic the user has mentioned before.\n"
+        " - location: 'where am I', 'what's my current location'. Must "
+        "explicitly ask WHERE.\n"
+        "\n"
+        "Chat includes: opinions, shopping, recommendations, general "
+        "knowledge, coding, weather, meta-questions about IRIS, anything "
+        "ambiguous.\n"
+        "\n"
+        "Examples:\n"
+        " - 'what computer should I get' -> chat\n"
+        " - 'recommend a good book' -> chat\n"
+        " - 'help me debug this python' -> chat\n"
+        " - 'what day is today' -> date\n"
+        " - 'take a picture' -> photo_take\n"
+        " - 'where am I' -> location\n"
+        "\n"
         "Return ONLY the JSON. No markdown, no prose, no explanation."
     )
 
@@ -4336,6 +4389,12 @@ class ChatTab(QWidget):
         print(f"[router] {text!r} -> {intent!r}")
 
         if intent in ("date", "time"):
+            # --- IRIS llm-router-guard: ADD ---
+            # Same guard rationale as location: re-validate against the
+            # regex-based date detector before running the date handler.
+            if iq is None or not iq.is_date_question(text):
+                return None
+            # --- IRIS llm-router-guard: END ---
             self._answer_date_question(text)
             return True
         if intent == "photo_take":
@@ -4365,6 +4424,16 @@ class ChatTab(QWidget):
             except Exception:
                 return None
         if intent == "location":
+            # --- IRIS llm-router-guard: ADD ---
+            # llama3.2:1b sometimes classifies shopping / advice / general
+            # questions ("what computer should I get") as location because
+            # of verbs like "get" or place-implying words. Re-validate
+            # against the regex trigger list — if the query has no real
+            # location cue, fall through to plain chat rather than
+            # hallucinating a WiFi-based answer.
+            if not self._is_location_question(text.lower().strip()):
+                return None
+            # --- IRIS llm-router-guard: END ---
             self._start_bg(lambda: self._answer_location_question(text))
             return True
         if intent == "photo_lookup":

@@ -43,6 +43,17 @@ DEFAULT_MAX_EMBEDDINGS_PER_KIND = 10
 DEFAULT_MATCH_THRESHOLD         = 0.60   # cosine similarity
 
 
+# --- IRIS consolidation: ADD ---
+# Tuneables that drive the startup / periodic consolidation pass. Kept at
+# module scope so tests can monkey-patch them without instantiating the
+# whole store.
+DEFAULT_UNKNOWN_MERGE_THRESHOLD = 0.65    # cosine sim on avg embeddings
+DEFAULT_SELF_MIN_FACES          = 5       # how many faces a row needs before
+                                          # we consider promoting/merging it
+DEFAULT_SELF_MIN_TIMES_SEEN     = 20      # ...and how often it's been seen
+# --- IRIS consolidation: END ---
+
+
 # ── dataclasses ──────────────────────────────────────────────────────────
 @dataclass
 class Person:
@@ -172,6 +183,16 @@ class PeopleStore:
         self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         self._open()
+        # --- IRIS consolidation: ADD ---
+        # One-shot cleanup pass on startup: fold the noisy Unknown-N mess
+        # into a smaller set of rows and pin the dominant unknown to the
+        # self row when one already exists (or promote it if there isn't
+        # one yet). Any failure here is non-fatal — the store still opens.
+        try:
+            self._startup_consolidate()
+        except Exception as e:
+            print(f"[people] startup consolidate failed (non-fatal): {e}")
+        # --- IRIS consolidation: END ---
 
     # ── connection lifecycle ────────────────────────────────────────────
     def _open(self) -> None:
@@ -484,6 +505,240 @@ class PeopleStore:
             except Exception as e:
                 print(f"[people] delete failed: {e}")
                 return False
+
+    # --- IRIS consolidation: ADD ---
+    # ── merge / consolidate: fold noisy duplicates into a canonical row ─
+    def merge_person_into(self, source_id: int, target_id: int) -> bool:
+        """Move all embeddings and conversations from `source_id` into
+        `target_id`, then delete the source row. Used to consolidate
+        duplicate Unknown-N rows produced by the face / voice pipelines
+        when the same person's embedding falls just below the strict
+        0.60 match threshold across sessions.
+
+        No-op when source == target. Never raises — returns False on any
+        failure. `target_id` is left with the union of both rows'
+        times_seen counts and its own name / is_self flag (i.e. merging
+        Unknown 3 into the self row keeps the self row's name)."""
+        if self._conn is None or source_id == target_id:
+            return source_id == target_id  # trivial success on identity
+        with self._lock:
+            try:
+                # Confirm both rows exist before touching anything.
+                src = self._conn.execute(
+                    "SELECT id, times_seen, first_seen, last_seen "
+                    "FROM people WHERE id = ?", (source_id,)).fetchone()
+                tgt = self._conn.execute(
+                    "SELECT id, times_seen, first_seen, last_seen "
+                    "FROM people WHERE id = ?", (target_id,)).fetchone()
+                if src is None or tgt is None:
+                    return False
+                # Move embeddings.
+                self._conn.execute(
+                    "UPDATE embeddings SET person_id = ? WHERE person_id = ?",
+                    (target_id, source_id))
+                # Move conversations.
+                self._conn.execute(
+                    "UPDATE conversations SET person_id = ? "
+                    "WHERE person_id = ?",
+                    (target_id, source_id))
+                # Move any pending prompts too so orphaned prompts don't
+                # linger pointing at a soon-to-be-deleted row.
+                self._conn.execute(
+                    "UPDATE pending_prompts SET person_id = ? "
+                    "WHERE person_id = ?",
+                    (target_id, source_id))
+                # Roll times_seen and seen-timestamps forward.
+                new_times = int(src["times_seen"] or 0) \
+                            + int(tgt["times_seen"] or 0)
+                new_first = min(float(src["first_seen"] or 0.0),
+                                 float(tgt["first_seen"] or 0.0)) \
+                            or max(float(src["first_seen"] or 0.0),
+                                    float(tgt["first_seen"] or 0.0))
+                new_last  = max(float(src["last_seen"] or 0.0),
+                                 float(tgt["last_seen"] or 0.0))
+                now = time.time()
+                self._conn.execute(
+                    "UPDATE people SET "
+                    "  times_seen = ?, first_seen = ?, "
+                    "  last_seen = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (new_times, new_first, new_last, now, target_id))
+                # Delete source row. CASCADE would have handled the child
+                # tables, but we already moved them so nothing to clean.
+                self._conn.execute(
+                    "DELETE FROM people WHERE id = ?", (source_id,))
+                # Trim any embedding overflow that the merge just caused.
+                self._enforce_cap(target_id, KIND_FACE)
+                self._enforce_cap(target_id, KIND_VOICE)
+                print(f"[people] merged person id={source_id} into "
+                      f"id={target_id}")
+                return True
+            except Exception as e:
+                print(f"[people] merge_person_into failed: {e}")
+                return False
+
+    def list_unknowns(self) -> list[Person]:
+        """All rows whose name looks like a placeholder ('Unknown', 'Unknown N',
+        empty). Returned newest-seen first."""
+        return [p for p in self.list_all() if _looks_unknown(p.name)]
+
+    def _avg_embedding(self, person_id: int,
+                       kind: str) -> Optional[np.ndarray]:
+        """Mean of a person's stored embeddings, re-normalised. Returns
+        None when there are none. Used for cross-row similarity so we
+        don't have to compare O(N x M) individual samples."""
+        embs = self.list_embeddings(person_id, kind)
+        if not embs:
+            return None
+        try:
+            stacked = np.stack(embs).astype(np.float32)
+        except Exception:
+            return None
+        m = stacked.mean(axis=0)
+        n = float(np.linalg.norm(m))
+        if n == 0.0:
+            return None
+        return (m / n).astype(np.float32, copy=False)
+
+    def consolidate_unknowns(
+        self, *,
+        face_threshold: float = DEFAULT_UNKNOWN_MERGE_THRESHOLD,
+        voice_threshold: float = DEFAULT_UNKNOWN_MERGE_THRESHOLD,
+    ) -> int:
+        """Fold Unknown-* rows into each other (and into the self row)
+        based on average-embedding cosine similarity. Greedy: iterate
+        unknowns in descending times_seen order, keep the first as the
+        canonical target, and merge any later row whose face OR voice
+        average is above threshold. If a self row exists, ANY unknown
+        that clears the threshold against the self row is folded into
+        the self row instead of another unknown.
+
+        Returns the number of merges performed. Non-destructive to
+        strictly named rows — only Unknown-* names are moved."""
+        if self._conn is None:
+            return 0
+        merges = 0
+        unknowns = self.list_unknowns()
+        if len(unknowns) < 2 and self.get_self() is None:
+            return 0
+        # Sort by times_seen desc so the most-seen unknown wins ties.
+        unknowns.sort(key=lambda p: (-p.times_seen, p.id))
+        self_row = self.get_self()
+
+        # Precompute averages so we only pay per person once.
+        avgs: dict[int, tuple[Optional[np.ndarray], Optional[np.ndarray]]] = {}
+        def _avg(pid: int):
+            if pid not in avgs:
+                avgs[pid] = (self._avg_embedding(pid, KIND_FACE),
+                             self._avg_embedding(pid, KIND_VOICE))
+            return avgs[pid]
+
+        self_face, self_voice = (None, None)
+        if self_row is not None:
+            self_face, self_voice = _avg(self_row.id)
+
+        # (1) Fold unknowns into the self row first.
+        merged_ids: set[int] = set()
+        if self_row is not None and (self_face is not None
+                                     or self_voice is not None):
+            for p in unknowns:
+                if p.id == self_row.id:
+                    continue
+                pf, pv = _avg(p.id)
+                sim_f = float(np.dot(pf, self_face)) \
+                        if pf is not None and self_face is not None else -1.0
+                sim_v = float(np.dot(pv, self_voice)) \
+                        if pv is not None and self_voice is not None else -1.0
+                if sim_f >= face_threshold or sim_v >= voice_threshold:
+                    if self.merge_person_into(p.id, self_row.id):
+                        merged_ids.add(p.id)
+                        merges += 1
+
+        # (2) Fold remaining unknowns into each other.
+        alive = [p for p in unknowns if p.id not in merged_ids]
+        for i, target in enumerate(alive):
+            if target.id in merged_ids:
+                continue
+            tf, tv = _avg(target.id)
+            if tf is None and tv is None:
+                continue
+            for candidate in alive[i + 1:]:
+                if candidate.id in merged_ids:
+                    continue
+                cf, cv = _avg(candidate.id)
+                sim_f = float(np.dot(cf, tf)) \
+                        if cf is not None and tf is not None else -1.0
+                sim_v = float(np.dot(cv, tv)) \
+                        if cv is not None and tv is not None else -1.0
+                if sim_f >= face_threshold or sim_v >= voice_threshold:
+                    if self.merge_person_into(candidate.id, target.id):
+                        merged_ids.add(candidate.id)
+                        merges += 1
+        if merges:
+            print(f"[people] consolidate_unknowns: merged {merges} "
+                  f"duplicate row{'s' if merges != 1 else ''}")
+        return merges
+
+    def ensure_self_from_dominant_unknown(
+        self, *,
+        min_faces: int = DEFAULT_SELF_MIN_FACES,
+        min_times_seen: int = DEFAULT_SELF_MIN_TIMES_SEEN,
+        self_name: str = "Humza",
+    ) -> Optional[Person]:
+        """Guarantee an is_self row exists.
+
+        Rules:
+          (a) If a row already has is_self=1, leave it alone (just return
+              it). Any Unknown row that looks like the same person will be
+              folded into it by consolidate_unknowns().
+          (b) Otherwise find the Unknown-* row with the most face
+              embeddings (or, tie-break, the highest times_seen). If it
+              clears `min_faces` and `min_times_seen`, mark it is_self=1
+              and rename it to `self_name`.
+          (c) If nothing crosses those bars, do nothing — returning None.
+
+        Returns the resulting self Person, or None if no promotion was
+        possible."""
+        existing_self = self.get_self()
+        if existing_self is not None:
+            return existing_self
+        # Also honor an existing row already named `self_name` — that's
+        # what the People-tab pre-marked as the user in the screenshots.
+        by_name = self.get_by_name(self_name)
+        if by_name is not None:
+            self.update_person_details(by_name.id, is_self=True)
+            return self.get(by_name.id)
+        unknowns = self.list_unknowns()
+        if not unknowns:
+            return None
+        # Prefer face-rich rows; tie-break with times_seen.
+        unknowns.sort(key=lambda p: (-p.face_count, -p.times_seen, p.id))
+        top = unknowns[0]
+        if top.face_count < min_faces or top.times_seen < min_times_seen:
+            return None
+        self.update_person_details(top.id, name=self_name, is_self=True)
+        print(f"[people] promoted {top.name!r} (id={top.id}, "
+              f"faces={top.face_count}, times_seen={top.times_seen}) "
+              f"to is_self=1 as {self_name!r}")
+        return self.get(top.id)
+
+    def _startup_consolidate(self) -> None:
+        """Run once from __init__ after _open() / _migrate(). Cheap when
+        the DB is clean, useful when it isn't. Order matters:
+          1. Try to fill in the is_self row from the noisy unknowns.
+          2. Then do the merge pass, which will fold matching unknowns
+             into that self row (or into each other)."""
+        if self._conn is None:
+            return
+        try:
+            self.ensure_self_from_dominant_unknown()
+        except Exception as e:
+            print(f"[people] ensure_self_from_dominant_unknown failed: {e}")
+        try:
+            self.consolidate_unknowns()
+        except Exception as e:
+            print(f"[people] consolidate_unknowns failed: {e}")
+    # --- IRIS consolidation: END ---
 
     # ── embeddings: add / list / evict ──────────────────────────────────
     def add_embedding(self, person_id: int, kind: str,
@@ -1067,6 +1322,23 @@ def _fmt_ts(ts: float) -> str:
         return datetime.fromtimestamp(ts).strftime("%b %d %H:%M:%S")
     except Exception:
         return "—"
+
+
+# --- IRIS consolidation: ADD ---
+def _looks_unknown(name: str) -> bool:
+    """True when a row's name is one of the placeholder-style labels the
+    face / voice pipelines hand out when they can't match a person: bare
+    'Unknown', 'Unknown 12', empty string. Used by list_unknowns() and
+    the consolidation pass to decide which rows are safe to fold."""
+    n = (name or "").strip().lower()
+    if not n:
+        return True
+    if n == "unknown":
+        return True
+    if n.startswith("unknown ") and n[8:].strip().isdigit():
+        return True
+    return False
+# --- IRIS consolidation: END ---
 
 
 def default_db_path() -> str:
