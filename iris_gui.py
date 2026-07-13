@@ -45,8 +45,9 @@ from PyQt6.QtWidgets import (
     QSlider, QAbstractItemView,
     QVBoxLayout, QHBoxLayout, QScrollArea, QGraphicsDropShadowEffect,
     QStackedWidget, QFileDialog, QSizePolicy, QSizeGrip,
-    QGridLayout, QTextEdit, QComboBox, QDialog,
-    QGridLayout, QLayout, QTextEdit, QComboBox, QDialog,
+    QGridLayout, QLayout, QTextEdit, QComboBox, QDialog, QComboBox, QDialog,
+    QProgressBar, QCheckBox,   # ── IRIS about-system feature: ADD ──
+
 )
 # Optional: real map needs PyQt6-WebEngine. Degrades to a glass list if absent.
 try:
