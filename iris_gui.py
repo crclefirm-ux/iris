@@ -2991,13 +2991,41 @@ class ChatTab(QWidget):
             msg = self._resolve_email_pending(low, self._email_pending_pick)
             if msg is not None:
                 self._active_email = msg
-                self._email_pending_pick = None
+                # --- IRIS email-pick-retention: CHANGE ---
+                # DON'T clear the pending pick here — keep it around so
+                # the user can pick a different one from the same list
+                # without having to re-search. Only cleared when a fresh
+                # search creates a new list (see _answer_email_question).
+                # --- IRIS email-pick-retention: END ---
+                print(f"[route] email-pick resolved -> "
+                      f"{getattr(msg, 'subject', '?')!r}")
                 self._append_iris(self._format_email_message(msg))
                 return
             n = len(self._email_pending_pick)
             self._append_iris(
                 f"I didn't catch which one. Reply with a number (1-{n}).")
             return
+        # --- IRIS email-pick-opportunistic: ADD ---
+        # If a pick list is pending and the user's next message OBVIOUSLY
+        # names one of the candidates by subject-word overlap (even if
+        # the sentence shape isn't a canonical pick reply — e.g. "can
+        # you talk about the netflix one now"), resolve against the list
+        # instead of falling through to a fresh Gmail search that
+        # searches for the LITERAL text of the sentence. Requires a
+        # confident match (>=2 distinctive words shared with exactly one
+        # candidate) so unrelated chat doesn't accidentally pick.
+        if self._email_pending_pick:
+            candidate = self._try_opportunistic_email_pick(
+                low, self._email_pending_pick)
+            if candidate is not None:
+                self._active_email = candidate
+                # Keep pending list alive so subsequent picks work too
+                # ("actually the family reunion one" after netflix pick).
+                print(f"[route] email-pick opportunistic -> "
+                      f"{getattr(candidate, 'subject', '?')!r}")
+                self._append_iris(self._format_email_message(candidate))
+                return
+        # --- IRIS email-pick-opportunistic: END ---
         # (1) A reply that picks from the most recently shown list. The list is
         # kept after a pick so several recordings can be chosen from one list.
         if self._pending_pick and self._is_pick_reply(low):
@@ -3072,6 +3100,26 @@ class ChatTab(QWidget):
             self._start_bg(lambda: self._answer_video_question(text))
             return
         # --- IRIS video-followup-priority: END ---
+
+        # --- IRIS email-followup-priority: ADD ---
+        # Follow-up questions on the CURRENTLY-ACTIVE email ("when's the
+        # deadline?", "what protein did humza want?", "who did he cc?").
+        # Without this gate the message either (a) fell into the LLM
+        # router which triggered a fresh Gmail search returning the same
+        # email, then the LLM answered without the body ever reaching
+        # _ask_ollama, or (b) fell all the way through to _ask_ollama
+        # whose _active_context_block only knew about audio recordings
+        # -- so the LLM got zero email context and hallucinated the
+        # "(no subject) / no mention of a deadline" reply seen in the
+        # screenshots. Route these to _ask_ollama directly; the
+        # extended _active_context_block now injects the full email
+        # body so the LLM answers from real content.
+        if self._active_email is not None \
+                and self._is_active_email_followup(low):
+            print(f"[route] active-email followup: {text!r}")
+            self._start_bg(lambda: self._ask_ollama(text))
+            return
+        # --- IRIS email-followup-priority: END ---
 
         # --- IRIS llm-first-routing: ADD ---
         # Everything past this point is a LOOKUP question, not an
@@ -3744,19 +3792,123 @@ class ChatTab(QWidget):
         if re.search(r"\b(?:pick|option|number|choice|no\.?|#)\s*\d{1,2}\b",
                      low):
             return True
+        # --- IRIS email-pick-widen: ADD ---
+        # "email 1", "email #2", "email number 3", "email one" — natural
+        # phrasings that used to fall through to a fresh Gmail search
+        # for the literal string "email 1 now from humza". Same shape
+        # for "the first email in the list", "talk about email 3".
+        if re.search(r"\bemail\s*#?\s*\d{1,2}\b", low):
+            return True
+        if re.search(
+                r"\bemail\s+(?:one|two|three|four|five|six|seven|"
+                r"eight|nine|ten)\b", low):
+            return True
+        # --- IRIS email-pick-widen: END ---
         if re.search(r"\b\d{1,2}(?:st|nd|rd|th)\b", low):
             return True
         words = ("first", "second", "third", "fourth", "fifth", "sixth",
                   "seventh", "eighth", "ninth", "tenth")
         return any(re.search(rf"\b{w}\b", low) for w in words)
+    # --- IRIS email-pick-opportunistic-helper: ADD ---
+    # Confidently pick from _email_pending_pick when the message names a
+    # candidate by SUBJECT WORDS even if the sentence isn't shaped like
+    # a pick reply. Returns None unless exactly one candidate wins with
+    # a strong lead — we don't want to pick on a single generic word
+    # match. Used as a pre-classifier gate so "can you talk about the
+    # netflix one now" resolves to the netflix email from the pending
+    # list instead of doing a fresh Gmail search that returns nothing.
+    def _try_opportunistic_email_pick(self, low: str, cands: list):
+        _STOP = {"the", "a", "an", "email", "emails", "one", "in", "list",
+                 "please", "of", "on", "to", "for", "with", "and", "or",
+                 "my", "your", "our", "this", "that", "it", "is", "was",
+                 "now", "can", "you", "talk", "about", "from", "give",
+                 "me", "us", "tell", "show", "want", "get", "read", "see"}
+        msg_words = {w for w in re.findall(r"[a-z]+", low or "")
+                     if w not in _STOP and len(w) >= 3}
+        if not msg_words:
+            return None
+        scored = []
+        for c in cands:
+            subj = (getattr(c, "subject", "") or "").lower()
+            subj_words = {w for w in re.findall(r"[a-z]+", subj)
+                          if w not in _STOP and len(w) >= 3}
+            score = len(msg_words & subj_words)
+            scored.append((score, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if not scored:
+            return None
+        top_score, top_cand = scored[0]
+        # Need at least 2 shared distinctive words AND a clear lead over
+        # the runner-up so ambiguous messages fall through to the
+        # classifier instead of picking arbitrarily.
+        if top_score < 2:
+            return None
+        second_score = scored[1][0] if len(scored) > 1 else 0
+        if top_score - second_score < 1:
+            return None
+        return top_cand
+    # --- IRIS email-pick-opportunistic-helper: END ---
+
     def _resolve_email_pending(self, low: str, cands: list):
+        # --- IRIS email-pick-resolve-widen: CHANGE ---
+        # Previously: ordinal words + first bare digit + fail.
+        # That missed:
+        #   * "email 1 now from humza"  (word 'email' before the digit
+        #     stopped a naive first-digit read from being reliable —
+        #     also the digit 1 comes before other digits sometimes)
+        #   * "the first one, netflix subscription update" (ordinal
+        #     worked, but if user says "the netflix one" or names the
+        #     subject there was no fallback)
+        #   * "email number 3", "email #2", "email two"
+        # Now: try in order (1) explicit "email N" / "email <word>",
+        # (2) ordinal word, (3) subject-substring match against
+        # candidate subjects, (4) bare number as last resort.
+        # --- IRIS email-pick-resolve-widen: END ---
+        # 1) Explicit "email N" / "email #N" / "email number N".
+        m = re.search(r"\bemail\s*(?:number\s*|#\s*)?(\d{1,2})\b", low)
+        if m:
+            idx = int(m.group(1))
+            if 1 <= idx <= len(cands):
+                return cands[idx - 1]
+        # "email one" ... "email ten"
+        word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4,
+                        "five": 5, "six": 6, "seven": 7, "eight": 8,
+                        "nine": 9, "ten": 10}
+        m = re.search(r"\bemail\s+(" + "|".join(word_to_num) + r")\b", low)
+        if m:
+            idx = word_to_num[m.group(1)]
+            if 1 <= idx <= len(cands):
+                return cands[idx - 1]
+        # 2) Ordinal word ("first", "second", ...).
         idx = self._parse_ordinal(low)
-        if idx is None:
-            m = re.search(r"\d{1,2}", low)
-            if m:
-                idx = int(m.group())
         if idx is not None and 1 <= idx <= len(cands):
             return cands[idx - 1]
+        # 3) Subject-substring match — "the netflix one", "grocery list",
+        # "family reunion" — pick whichever candidate's subject shares
+        # the most distinctive words with the message. Requires at least
+        # one non-stopword overlap.
+        _STOP = {"the", "a", "an", "email", "one", "in", "list", "please",
+                 "of", "on", "to", "for", "with", "and", "or", "my",
+                 "your", "our", "this", "that", "it", "is", "was"}
+        msg_words = {w for w in re.findall(r"[a-z]+", low)
+                     if w not in _STOP and len(w) >= 3}
+        if msg_words:
+            best, best_score = None, 0
+            for c in cands:
+                subj_words = {w for w in re.findall(
+                    r"[a-z]+", (getattr(c, "subject", "") or "").lower())
+                    if w not in _STOP and len(w) >= 3}
+                score = len(msg_words & subj_words)
+                if score > best_score:
+                    best, best_score = c, score
+            if best is not None and best_score >= 1:
+                return best
+        # 4) Bare number anywhere in the message as last resort.
+        m = re.search(r"\b(\d{1,2})\b", low)
+        if m:
+            idx = int(m.group(1))
+            if 1 <= idx <= len(cands):
+                return cands[idx - 1]
         return None
     # ── Pick-reply detection + resolution (multi-pick from one list) ─────
     @staticmethod
@@ -4125,12 +4277,79 @@ class ChatTab(QWidget):
                     "moment.")
         return self._ask_ollama(text)
     def _active_context_block(self) -> Optional[str]:
-        if not self._active or not self._active.has_transcript:
+        # --- IRIS email-context-injection: CHANGE ---
+        # Previously returned only the active recording's transcript.
+        # If an email was active and the user asked a follow-up like
+        # "when do I need to get the items by?", _ask_ollama got NO
+        # email context and hallucinated a reply ("Unfortunately, I
+        # don't have any specific details on deadlines..." or the
+        # nonsense 'I found it!' garbled-transcript reply). Now we
+        # bundle every active surface (recording + email + video) so
+        # the LLM answers from real content instead of guessing.
+        blocks: list = []
+        # Active audio recording — full transcript, first (most-anchor).
+        if self._active is not None \
+                and getattr(self._active, "has_transcript", False):
+            try:
+                blocks.append(
+                    f"The user may be asking about this RECORDING:\n"
+                    f"name: {self._active.name}\n"
+                    f"recorded: {self._active.when()}  "
+                    f"length: {self._active.length()}\n"
+                    f"TRANSCRIPT:\n"
+                    f"{self._truncate(self._active.transcript, 7000)}"
+                )
+            except Exception:
+                pass
+        # Active email — full body, sender, subject, date. Truncated
+        # generously (6000 chars) — the display truncation at 1500 is a
+        # UI concern, the LLM should see the whole thing.
+        if self._active_email is not None:
+            try:
+                em = self._active_email
+                subject = getattr(em, "subject", "") or "(no subject)"
+                sender = getattr(em, "sender", "") or "(unknown sender)"
+                try:
+                    when = em.when()
+                except Exception:
+                    when = getattr(em, "date", "") or ""
+                body = (getattr(em, "body", "") or "").strip()
+                if not body:
+                    body = (getattr(em, "snippet", "") or "").strip()
+                if body:
+                    blocks.append(
+                        f"The user may be asking about this EMAIL. "
+                        f"Answer strictly from the body below. If the "
+                        f"body doesn't mention what they asked, say so "
+                        f"— do NOT invent details.\n"
+                        f"from: {sender}\n"
+                        f"subject: {subject}\n"
+                        f"when: {when}\n"
+                        f"BODY:\n"
+                        f"{self._truncate(body, 6000)}"
+                    )
+            except Exception:
+                pass
+        # Active video — clip name + scene descriptions from sidecar.
+        if self._active_video is not None:
+            try:
+                vid = self._active_video
+                vname = getattr(vid, "name", "") or "video clip"
+                vdesc = getattr(vid, "scene_description", "") \
+                    or getattr(vid, "description", "") \
+                    or ""
+                if vdesc:
+                    blocks.append(
+                        f"The user may be asking about this VIDEO:\n"
+                        f"name: {vname}\n"
+                        f"SCENE:\n{self._truncate(vdesc, 2500)}"
+                    )
+            except Exception:
+                pass
+        if not blocks:
             return None
-        return (f"The user is asking about this recording:\n"
-                f"name: {self._active.name}\n"
-                f"recorded: {self._active.when()}  length: {self._active.length()}\n"
-                f"TRANSCRIPT:\n{self._truncate(self._active.transcript, 7000)}")
+        return "\n\n".join(blocks)
+        # --- IRIS email-context-injection: END ---
     @staticmethod
     def _truncate(text: str, limit: int) -> str:
         text = (text or "").strip()
@@ -5020,6 +5239,70 @@ class ChatTab(QWidget):
         low = (low or "").strip()
         return any(cue in low for cue in self._EMAIL_TRANSCRIPT_CUES)
 
+    # --- IRIS active-email-followup: ADD ---
+    # Detects a bare CONTENT follow-up on the currently-active email:
+    # "when do I need to get the items by?", "what protein did humza
+    # want?", "who did he cc?", "what's the total?". Deliberately
+    # NARROW so a stale _active_email reference can't hijack unrelated
+    # chat. Rejects: messages that name a NEW email (topic/sender/
+    # ordinal), summary-only requests (handled separately by
+    # _is_email_summary_followup), and messages that name another
+    # domain (recording/video/photo/location).
+    _EMAIL_FOLLOWUP_OTHER_DOMAIN = (
+        "recording", "transcript", "audio", "conversation",
+        "video", "clip", "footage",
+        "photo", "picture", "screenshot",
+        "where am i", "where are we", "current location",
+    )
+    _EMAIL_FOLLOWUP_QUESTION_STARTERS = (
+        "when", "what", "where", "who", "why", "how",
+        "which", "whose", "is there", "are there",
+        "does the email", "does it", "did they", "did he", "did she",
+        "can you tell", "tell me", "any mention", "any deadline",
+        "any date", "any time",
+    )
+
+    def _is_active_email_followup(self, low: str) -> bool:
+        low = (low or "").strip().rstrip("?!.")
+        if not low:
+            return False
+        # A summary/transcript-style request is handled by the summary
+        # follow-up path, not here.
+        if self._is_email_summary_followup(low):
+            return False
+        # If the sentence names a NEW email (topic/sender/ordinal), we
+        # want the fresh-search flow, not the follow-up flow.
+        if iq is not None:
+            try:
+                if iq._extract_email_topic(low):
+                    return False
+            except Exception:
+                pass
+            try:
+                if iq._extract_email_sender(low):
+                    return False
+            except Exception:
+                pass
+        for word in self._ORDINAL_WORDS:
+            if re.search(rf"\b{re.escape(word)}\b", low):
+                return False
+        # Reject messages naming another handled domain.
+        if any(n in low for n in self._EMAIL_FOLLOWUP_OTHER_DOMAIN):
+            return False
+        # Positive shape: short question, or question-starter, or a
+        # short pronoun-referencing sentence.
+        if len(low.split()) > 18:
+            return False
+        if any(low.startswith(s) for s in
+                self._EMAIL_FOLLOWUP_QUESTION_STARTERS):
+            return True
+        pronouns = (" it", " this", " that", " they", " them", " he",
+                    " she", " his", " her", " their")
+        if any(p in f" {low}" for p in pronouns) and len(low.split()) <= 10:
+            return True
+        return False
+    # --- IRIS active-email-followup: END ---
+
     def _summarize_active_email(self, mode: str = "summary") -> str:
         """Post either a Llama-generated summary of self._active_email
         or its full body verbatim (transcript). Mode is chosen upstream
@@ -5889,6 +6172,20 @@ class ChatTab(QWidget):
             # Build context from summaries only (much shorter than full
             # transcripts — lets us include several recent recordings at once).
             ctx = self._active_context_block()   # uses full transcript if active
+            # --- IRIS ask-ollama-audit-log: ADD ---
+            # Log whether context was actually injected. Without this,
+            # "why did it hallucinate the email content?" is guesswork.
+            try:
+                have_email = self._active_email is not None
+                have_rec = self._active is not None and getattr(
+                    self._active, "has_transcript", False)
+                ctx_len = len(ctx) if ctx else 0
+                print(f"[ask-ollama] q={text!r} "
+                      f"active_email={have_email} active_rec={have_rec} "
+                      f"ctx_chars={ctx_len}")
+            except Exception:
+                pass
+            # --- IRIS ask-ollama-audit-log: END ---
             if not ctx:
                 try:
                     recs = sorted(self._all_recordings(),
