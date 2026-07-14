@@ -3049,6 +3049,20 @@ class ChatTab(QWidget):
             self._handle_action_intent(act_intent)
             return
 
+        # --- IRIS llm-first-routing: ADD ---
+        # Everything past this point is a LOOKUP question, not an
+        # action — let the LLM router (llama3.2:3b) decide the domain
+        # using real semantic understanding, instead of requiring the
+        # message to hit one of the hardcoded cue phrases each
+        # classifier below still keeps as a fallback.
+        routed = self._llm_route_intent(text)
+        if routed is True:
+            return
+        if routed is False:
+            self._start_bg(lambda: self._ask_ollama(text))
+            return
+        # --- IRIS llm-first-routing: END ---
+
         # An email read/check command ("read my email", "email about
         # handshake"). Bare ordinal follow-ups ("the third one") with no
         # email noun at all only route here if an email context is already
@@ -3185,18 +3199,12 @@ class ChatTab(QWidget):
             self._do_content(intent)
             return
         # k == "none"
-        # --- IRIS llm-router: ADD ---
-        # Last-chance fallback: nothing in the hardcoded classifier
-        # tree matched, but the message might still be a normal request
-        # ('yo can u snap a pic', 'iris film me for 10 seconds', 'wut is
-        # in my inbox'). Hand it to the Llama-1B intent router — cheap,
-        # typo-tolerant, and routes to the appropriate handler when it
-        # can. Falls back to plain chat if the router says 'chat' or
-        # the model isn't reachable.
-        routed = self._llm_route_intent(text)
-        if routed is not None:
-            return
-        # --- IRIS llm-router: END ---
+        # --- IRIS llm-first-routing: CHANGE ---
+        # No second call to _llm_route_intent here — it already ran
+        # once, earlier, in _route_command before this keyword cascade
+        # was ever reached. Reaching this point means that earlier call
+        # already returned False or None and the keyword cascade below
+        # it also came up empty.
         if self._active is not None or self._active_photo is not None:
             self._start_bg(lambda: self._answer_followup(text))
             return
@@ -4453,6 +4461,15 @@ class ChatTab(QWidget):
         # recording, so it must keep routing to the transcript handlers.
         if not any(w in low for w in ("video", "clip", "footage")):
             return False
+        # --- IRIS video-vs-audio-fallthrough: ADD ---
+        # "video" and "footage" are unambiguous in this app — they never
+        # refer to an audio recording — so ANY mention of them is a video
+        # question regardless of exact phrasing. "clip" alone stays
+        # cue-gated below since it's also used generically for audio
+        # clips elsewhere in this app.
+        if "video" in low or "footage" in low:
+            return True
+        # --- IRIS video-vs-audio-fallthrough: END ---
         cues = ("how many", "how much", "who ", "who's", "whos", "was in",
                 "were in", "people in", "person in", "in the video",
                 "in that video", "in the clip", "in that clip", "in the "
@@ -5059,11 +5076,19 @@ class ChatTab(QWidget):
 
     # --- IRIS router-guard: ADD ---
     def _router_intent_guard(self, intent: str, text: str) -> bool:
-        """Cross-validate the LLM router's classification against regex
-        heuristics. Returns True only when the query has independent
-        evidence for the claimed intent. This is the single place where
-        every specialised intent's 'sanity check' lives — new intents
-        get added here, not in per-branch if-blocks."""
+        """Sanity-check the LLM router's classification. This is
+        deliberately asymmetric now: for lookup/question intents (date,
+        location, recording, memory, email, photo_lookup, video_lookup)
+        we TRUST the LLM's own semantic judgment directly — a wrong
+        lookup only costs a re-ask. Only the two intents that actually
+        TAKE AN ACTION with a real-world side effect (photo_take fires
+        the camera, video_take starts recording) still get an
+        independent regex confirmation, since a wrong guess there does
+        something rather than just answering wrong.
+
+        Coding-query and meta-question overrides stay unconditional —
+        those are a blanket correction for a known small-model failure
+        mode, not per-domain keyword requirements."""
         low = (text or "").lower().strip()
         if not low:
             return False
@@ -5095,48 +5120,7 @@ class ChatTab(QWidget):
         except Exception:
             pass
 
-        if intent in ("date", "time"):
-            try:
-                return iq is not None and iq.is_date_question(text)
-            except Exception:
-                return False
-
-        if intent == "location":
-            try:
-                return self._is_location_question(low)
-            except Exception:
-                return False
-
-        if intent == "recording":
-            _NOUNS = ("recording", "recordings", "audio", "transcript",
-                      "transcripts", "conversation", "conversations",
-                      "clip", "clips", "recorded", "voice memo",
-                      "voice note", "voice notes", "session")
-            return any(n in low for n in _NOUNS)
-
-        if intent == "memory":
-            # Memory queries reference the user's past — past-tense verbs
-            # or explicit recall words. Coding hints are already rejected
-            # above, so if we got here it's a plausible memory query.
-            _CUES = ("did i", "what did", "when did", "who did",
-                     "where did", "remember", "remind", "recall",
-                     "we talked", "we discussed", "you mentioned",
-                     "i told you", "i said", "last time", "yesterday",
-                     "earlier", "before", "conversation about",
-                     "talked about")
-            return any(c in low for c in _CUES)
-
-        if intent == "email":
-            try:
-                ei = iq.classify_email(text) if iq is not None else None
-                if ei is not None and ei.kind != "none":
-                    return True
-                ai = iq.classify_action(text) if iq is not None else None
-                return (ai is not None
-                        and ai.kind == "action_open_email")
-            except Exception:
-                return False
-
+        # --- IRIS llm-first-routing: CHANGE ---
         if intent == "photo_take":
             try:
                 ai = iq.classify_action(text) if iq is not None else None
@@ -5150,45 +5134,45 @@ class ChatTab(QWidget):
             return (any(c in low for c in _CUES)
                     and any(v in low for v in _VERBS))
 
-        if intent == "photo_lookup":
-            _NOUNS = ("photo", "photos", "picture", "pictures", "pic",
-                      "pics", "screenshot", "screenshots", "snapshot")
-            return any(n in low for n in _NOUNS)
-
         if intent == "video_take":
             _CUES = ("record", "film", "shoot", "start recording",
                      "capture video", "start the camera", "start camera")
             return (any(c in low for c in _CUES) and "video" in low) \
                    or "start recording" in low
 
-        if intent == "video_lookup":
-            try:
-                if hasattr(self, "_is_video_question"):
-                    return self._is_video_question(low)
-            except Exception:
-                pass
-            return ("video" in low or "clip" in low or "footage" in low)
-
-        # Unknown intent value from the LLM — reject.
-        return False
+        # Every other non-chat intent is a lookup/question — trust the
+        # LLM's semantic judgment directly, no keyword cue required.
+        return True
+        # --- IRIS llm-first-routing: END ---
     # --- IRIS router-guard: END ---
    
     def _llm_route_intent(self, text: str):
-        """Ollama-backed universal fallback for _dispatch_intent. Called
-        when every hardcoded classifier returned kind='none'. Ask
-        llama3.2:1b which handler to invoke and dispatch accordingly.
+        """Ollama-backed, semantics-first intent router. This is now the
+        PRIMARY way _route_command decides which domain (video / audio
+        recording / photo / email / location / memory / chat) a lookup
+        question belongs to — it no longer waits for every keyword
+        classifier to give up first.
 
-        Returns True if the router successfully dispatched (caller
-        should stop), None if it fell through (caller should continue
-        with its own fallback — typically _ask_ollama)."""
+        Three-way return so the caller can tell "confidently not a
+        specialised intent" apart from "couldn't ask at all":
+          True  - dispatched a specialised handler. Caller should stop.
+          False - the router (or its guard) confidently decided this
+                  ISN'T a specialised intent. Caller should treat this
+                  as chat directly — NOT fall through to the keyword
+                  cascade, since a keyword false-positive there would
+                  silently override a correct LLM judgment.
+          None  - Ollama is unreachable or never returned usable JSON.
+                  Caller should fall back to the keyword cascade so
+                  IRIS still works with the model server down."""
         if self._client is None:
             return None
-        # Skip on bare greetings — no need to burn tokens on 'hi'.
+        # Skip on bare greetings — no need to burn tokens on 'hi'. This is
+        # a confident "not a specialised intent", not an unavailability.
         low = (text or "").lower().strip().rstrip("?!.")
         if not low or low in {"hi", "hello", "hey", "yo", "sup", "hola",
                               "howdy", "hiya", "morning", "afternoon",
                               "evening", "thanks", "thank you", "ty"}:
-            return None
+            return False
         # --- IRIS outlines: CHANGE ---
         # Prefer Ollama's built-in structured output ("format" parameter)
         # so the model is guaranteed to emit valid JSON matching the
@@ -5248,7 +5232,7 @@ class ChatTab(QWidget):
         if not self._router_intent_guard(intent, text):
             print(f"[router] rejected {intent!r} — regex disagrees, "
                   f"falling back to chat")
-            return None
+            return False
         # --- IRIS router-guard: END ---
 
         if intent in ("date", "time"):
@@ -5264,7 +5248,7 @@ class ChatTab(QWidget):
                 self._handle_action_intent(iact)
                 return True
             except Exception:
-                return None
+                return False
         if intent == "email":
             # Re-run email classifier + LLM extraction, then dispatch.
             ei = self._classify_email_intent(text) if hasattr(
@@ -5279,23 +5263,70 @@ class ChatTab(QWidget):
                 self._start_bg(lambda: self._answer_email_question(latest))
                 return True
             except Exception:
-                return None
+                return False
         if intent == "location":
             self._start_bg(lambda: self._answer_location_question(text))
             return True
         if intent == "photo_lookup":
+            # --- IRIS llm-first-routing: CHANGE ---
+            # Used to always ask for "all" photos. Now run it through
+            # the same date/range/time parsing classify()'s
+            # is_photo_query branch uses, so "photos from last Tuesday"
+            # still resolves to that specific date.
+            try:
+                dr = iq.parse_date_range(text, datetime.now())
+                if dr:
+                    self._do_photo_query(iq.Intent(
+                        kind="photo_query", photo_action="range",
+                        date_range=dr, corrected_text=text))
+                    return True
+                d = iq.parse_one_date(text, datetime.now())
+                rel = iq.parse_relative_day(text, datetime.now())
+                if d is None and rel is not None:
+                    d = rel
+                if d is not None:
+                    pi = iq.Intent(kind="photo_query", photo_action="date",
+                                    dates=[d], corrected_text=text)
+                    tm = iq.parse_time(text)
+                    if tm is not None:
+                        pi.time = tm
+                    self._do_photo_query(pi)
+                    return True
+                tm = iq.parse_time(text)
+                if tm is not None:
+                    self._do_photo_query(iq.Intent(
+                        kind="photo_query", photo_action="time",
+                        time=tm, corrected_text=text))
+                    return True
+            except Exception:
+                pass
             self._do_photo_query(iq.Intent(kind="photo_query",
                                             photo_action="all",
                                             corrected_text=text))
             return True
+            # --- IRIS llm-first-routing: END ---
         if intent == "recording":
-            # Point at the latest recording as the safest fallback.
+            # --- IRIS llm-first-routing: CHANGE ---
+            # Used to always default to the latest recording. Now hand
+            # off to classify()'s full date/range/content-search parsing
+            # first — "the recording from June 6 to June 10" should
+            # still get that specific range, not just "latest".
+            try:
+                rintent = iq.classify(text, self._all_recordings(),
+                                       datetime.now(),
+                                       has_active=bool(self._active))
+            except Exception:
+                rintent = None
+            if rintent is not None and rintent.kind != "none":
+                self._dispatch_intent(rintent, text)
+                return True
             rec = iq.latest(self._all_recordings())
             if rec is None:
                 self._append_iris("I don't see any recordings yet.")
                 return True
             self._start_bg(lambda: self._handle_recording(rec))
             return True
+            # --- IRIS llm-first-routing: END ---
         if intent == "video_lookup":
             self._start_bg(lambda: self._answer_video_question(text))
             return True
@@ -5309,9 +5340,10 @@ class ChatTab(QWidget):
                 self._start_bg(lambda: self._handle_memory_query(mem, text))
                 return True
             except Exception:
-                return None
-        # intent == 'chat' or unknown -> let caller ask Ollama normally.
-        return None
+                return False
+        # intent == 'chat' or unknown -> confidently not a specialised
+        # intent. Caller answers as chat directly.
+        return False
     # --- IRIS llm-router: END ---
 
     # --- IRIS date-question: ADD ---
